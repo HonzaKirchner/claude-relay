@@ -1,0 +1,113 @@
+# AGENTS.md
+
+Guidance for coding agents working in this repository.
+
+## What this is
+
+`claude-relay` is a small, dependency-free HTTP service that runs headless Claude Code (`claude --print`) sessions inside a Coder workspace, so `claude` can be driven from outside the workspace through Coder's app proxy. It is only meant to run inside a Coder workspace: Coder handles authentication, so the service itself has none and listens on loopback only.
+
+Its primary consumer is [Rakazo](https://rakazo.com)'s **Cloud Agent** integration ([docs](https://rakazo.com/docs/self-host-integrations/#cloud-coding-agents)). The service was extracted from `infra/claude-code-runner` in the fork <https://github.com/HonzaKirchner/rakazo> (commit `951f012`, "coder runner"). **Upstream [elie222/rakazo](https://github.com/elie222/rakazo) has neither the runner nor a Coder provider**: upstream only knows the `cursor` and `emulator` providers, and treats any other `CLOUD_AGENT_PROVIDER` value as `none`. Upstream rakazo can only reach this service through the fork's Coder adapter.
+
+## Layout
+
+| File | Role |
+| --- | --- |
+| `src/index.ts` | Entry point: reads env, loads state, listens on `127.0.0.1:$PORT`. |
+| `src/http.ts` | Routing, request validation, error → status mapping. |
+| `src/runner.ts` | `AgentRunner`: per-agent checkout, `claude` process, commit/push/PR, persistence. |
+| `src/runner.test.ts` | End-to-end tests over HTTP with fake `claude` and `gh` scripts and a local git origin. |
+
+## Commands
+
+Node ≥ 22.18 runs the TypeScript source directly (type stripping); there is no build step.
+
+```bash
+npm install      # dev deps only: typescript, vitest, @types/node
+npm run check    # tsc --noEmit
+npm test         # vitest
+npm start        # node src/index.ts
+```
+
+Run `npm run check` and `npm test` before finishing any change.
+
+In an apix dev sandbox, [`apix.yaml`](apix.yaml) defines the `relay` service and the `test` and `check` tasks. Node comes from `.nvmrc`. If you rename the startup log line in `src/index.ts`, also update `ready_when` in `apix.yaml`.
+
+## Code rules
+
+- **No runtime dependencies.** Only `node:` built-ins in `src/`. Dev dependencies are fine.
+- Only erasable TypeScript (`erasableSyntaxOnly`): no enums, namespaces or parameter properties. Import local files with the `.ts` extension.
+- Child processes are spawned `detached` and stopped by process group, so cancel also kills anything `claude` started. Keep that when adding commands; route them through `AgentRunner.exec` so cancel can reach them.
+- State is written atomically (temp file + rename). Keep records backwards-compatible: existing `agents/*.json` files must still load.
+
+## The Rakazo Cloud Agent contract
+
+The contract has two layers:
+
+1. **Provider-neutral, owned by upstream rakazo.** This is the `CloudAgentProvider` interface (`packages/adapter-kit/src/interfaces.ts`, types in `types.ts`, errors in `cloud-agents.ts`). The behaviour core relies on lives in `packages/adapters/src/cloud-agent-poll.ts`, and `cloud-agent-conformance.test.ts` and the Cursor adapter serve as the reference. See "Semantics Rakazo relies on" below.
+2. **HTTP wire format, owned by the fork's adapter** `packages/adapters/src/coder-cloud-agent.ts` (`CoderCloudAgentProvider`). It maps the interface onto the endpoints below. Check that adapter before changing anything observable here.
+
+### Transport
+
+- Rakazo reaches the service through Coder's app proxy at `/@<owner>/<workspace>/apps/claude-code-runner/<path>`, authenticated by the workspace owner's Coder token. The app slug **`claude-code-runner` is hard-coded in Rakazo**.
+- The service itself does no authentication and listens on loopback only, by design: it runs only inside a Coder workspace. Do not add a non-loopback listener without adding authentication.
+- Rakazo treats a non-JSON or code-less error response as "workspace not reachable" and starts the workspace. So **every response from this service must be JSON**, and every error must carry a `code`.
+- Rakazo reads at most 1 MB of a response and times out requests after 30 s.
+
+### Endpoints
+
+All bodies are JSON. `:id` and `:runId` match `[A-Za-z0-9_-]{1,128}`.
+
+| Method & path | Body | Behaviour |
+| --- | --- | --- |
+| `GET /health` | – | `{ "ok": true }` |
+| `PUT /agents/:id` | `LaunchRequest` | Creates the agent and its first run. **Idempotent**: repeating it with the same id returns the existing agent's latest run and starts nothing. |
+| `GET /agents/:id` | – | Latest run. |
+| `GET /agents/:id/runs/:runId` | – | A specific run. |
+| `POST /agents/:id/runs` | `PromptRequest` | Starts a follow-up that resumes the same Claude session. `409 busy` while a run is going. |
+| `POST /agents/:id/runs/:runId/cancel` | `{}` | Stops the run and **responds only once it has stopped**, with the final state. Cancelling a finished run returns it unchanged. |
+
+```ts
+type Image = { data: string; mimeType: "image/png" | "image/jpeg" | "image/gif" | "image/webp" } | { url: string };
+interface PromptRequest { prompt: string /* non-blank, ≤ 100 000 chars */; images?: Image[] /* ≤ 5 */ }
+interface LaunchRequest extends PromptRequest { repository?: string /* https URL */; openPr?: boolean }
+```
+
+Every success response is an `AgentView`:
+
+```ts
+interface AgentView {
+  id: string;
+  title: string;            // first line of the launch prompt, ≤ 80 chars
+  status: "running" | "finished" | "failed" | "cancelled";
+  runId: string;            // must match ^[A-Za-z0-9_-]+$ (Rakazo validates it)
+  branch?: string;          // only once pushed
+  prUrl?: string;
+  error?: string;
+}
+```
+
+Errors are `{ "code": ... }`, and Rakazo maps them as follows:
+
+| Status | `code` | Rakazo's reaction |
+| --- | --- | --- |
+| 400 | `invalid` | Request rejected, not retried. |
+| 404 | `not_found` | Agent gone, not retried. |
+| 409 | `busy` | Follow-up refused; Rakazo observes the current run instead of resending. |
+| 500 | `internal` | Generic failure. |
+| 404 | `route_not_found` | Generic failure. |
+
+### Semantics Rakazo relies on
+
+- **Agent ids** are chosen by Rakazo: the first 32 hex chars of a SHA-256 of its idempotency key. Launch idempotency is what makes a lost launch response safe to resend.
+- **Runs**: each launch or follow-up creates a new `runId`. Rakazo tracks follow-ups by `runId` and polls `GET /agents/:id/runs/:runId`, so old runs must stay readable.
+- **Sessions**: the first run uses `--session-id <uuid>`, follow-ups use `--resume <uuid>`, so context carries over.
+- **Repository work**: with `repository`, the agent works in its own clone on branch `agent/<first 12 chars of id>`. When a run finishes successfully, leftover changes are committed with the title as message, the branch is pushed, and with `openPr` one PR is opened (or the existing one reused) via `gh`. Failed or cancelled runs publish nothing.
+- **Restarts**: a run that was `running` when the service stopped is reported as `failed` on the next start. Data lives in `RUNNER_DATA_DIR` (`agents/`, `work/`, `logs/<agent>/<run>.jsonl`) and must survive restarts.
+- **Workspace lifecycle** (start on demand, retry later) is Rakazo's job, not this service's.
+- **Lost follow-up responses**: upstream's poller never resends a follow-up blindly. It calls `GET /agents/:id` and treats a new `runId` as proof the follow-up was accepted. So the latest run must be visible as soon as `POST /agents/:id/runs` returns.
+- **Cancel by run**: the poller cancels the run it is tracking. Cancelling an older, already-finished run must return that run unchanged and must not touch a newer one.
+- **`expired`**: the interface also has an `expired` status (agent gone or archived). This service never reports it. Agents and checkouts are kept forever.
+
+### Changing the contract
+
+Additive changes (new optional response fields, new endpoints) are safe. Anything else — renaming fields, changing status codes or error codes, changing idempotency or cancel semantics, changing the branch naming — needs a matching change in Rakazo's `coder-cloud-agent.ts` and its tests. Update this file and `README.md` with any contract change.

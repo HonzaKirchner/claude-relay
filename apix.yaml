@@ -1,0 +1,34 @@
+# apix.yaml — how an apix dev sandbox (apify-dev-sandbox) installs and runs claude-relay.
+
+name: claude-relay
+
+# node version: .nvmrc. No runtime dependencies; this installs the dev tooling
+# (typescript, vitest) for the check and test tasks.
+setup:
+  - nvm install
+  - npm ci
+
+services:
+  relay:
+    command: 'npm start'
+    description: >-
+      The Claude Code runner HTTP API on 127.0.0.1:4115 (Rakazo's Cloud Agent
+      contract, see AGENTS.md). Loopback only by design, so call it from inside
+      the sandbox; it is not published to the host. Runs need `claude` logged
+      in (and `gh` for pull requests); set CLAUDE_COMMAND / GH_COMMAND to
+      point elsewhere.
+    ready_when: 'claude-code-runner listening on'
+    ready_timeout_seconds: 30
+
+tasks:
+  test:
+    command: 'npm test -- {{args}}'
+    description: >-
+      The vitest suite (fake claude and gh, local git origin), a few seconds.
+      Pass a name filter with -t to run one case. Needs no services.
+    timeout_seconds: 300
+
+  check:
+    command: 'npm run check'
+    description: Type-checks src with tsc. Needs no services.
+    timeout_seconds: 300
