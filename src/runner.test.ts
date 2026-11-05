@@ -264,10 +264,10 @@ afterEach(async () => {
 describe("claude code runner", () => {
   it("links each run to its conversation page when APP_URL is set", async () => {
     expect((await call("PUT", "/conversations/plain", { prompt: "hi" })).body.url).toBeUndefined();
-    await restart("https://coder.example.com/@me/ws/apps/claude-code-runner/");
+    await restart("https://coder.example.com/@me/ws/apps/claude/");
     const launched = await call("PUT", "/conversations/linked", { prompt: "Say <hi>" });
     expect(launched.body.url).toBe(
-      `https://coder.example.com/@me/ws/apps/claude-code-runner/ui/conversations/linked`,
+      `https://coder.example.com/@me/ws/apps/claude/ui/conversations/linked`,
     );
     await runner.idle();
     const page = await fetch(`${base}/ui/conversations/linked`);
@@ -364,9 +364,24 @@ describe("claude code runner", () => {
     await runner.idle();
     const result = await call("GET", "/conversations/broken");
     expect(result.body.status).toBe("failed");
-    expect(result.body.summary).toBeUndefined();
+    // Rakazo shows only `summary`, so a failed run says there why it failed.
+    expect(result.body.error).toBe("Claude Code failed: error_during_execution");
+    expect(result.body.summary).toBe(result.body.error);
     expect(result.body.branch).toBeUndefined();
     expect(result.body.prUrl).toBeUndefined();
+  });
+
+  it("cuts the summary to what Rakazo keeps of a reply", async () => {
+    const line = "x".repeat(25_000);
+    await call("PUT", "/conversations/long", { prompt: `${line}\nmore` });
+    await runner.idle();
+    const { title, summary } = (await call("GET", "/conversations/long")).body;
+    expect(title).toHaveLength(80);
+    expect(summary).toHaveLength(20_000);
+    expect(summary!.startsWith("Done: xxx")).toBe(true);
+    expect(summary!.endsWith("…")).toBe(true);
+    // The whole answer is in the database.
+    expect(await sql("SELECT length(result_text) AS n FROM runs WHERE conversation_id = 'long'")).toEqual([{ n: 25_006 }]);
   });
 
   it("reports why Claude Code failed and starts the session again after it refused", async () => {

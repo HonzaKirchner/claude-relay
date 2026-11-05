@@ -17,7 +17,7 @@ const options = {
   dataDir: process.env.RUNNER_DATA_DIR || path.join(os.homedir(), ".claude-code-runner"),
   claudeCommand: process.env.CLAUDE_COMMAND || "claude",
   ghCommand: process.env.GH_COMMAND || "gh",
-  // Base URL of this service in a browser, e.g. https://coder.example.com/@me/ws/apps/claude-code-runner.
+  // Base URL of this service in a browser, e.g. https://coder.example.com/@me/ws/apps/claude.
   // When set, every ConversationView carries `url`, a link to the conversation page.
   publicUrl: process.env.APP_URL || undefined,
 };

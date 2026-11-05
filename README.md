@@ -21,30 +21,30 @@ Settings come from the environment, or from `.env` when started with `npm start`
 | `RUNNER_DATA_DIR` | `~/.claude-code-runner` | Only the git checkouts Claude works in (`work/<id>`), no conversation data. Keep it on the persistent home volume so follow-ups find their checkout. |
 | `CLAUDE_COMMAND` | `claude` | |
 | `GH_COMMAND` | `gh` | |
-| `APP_URL` | – | The service's base URL in a browser, e.g. `https://coder.example.com/@owner/workspace/apps/claude-code-runner`. When set, responses include `url`, a link to the conversation page. |
+| `APP_URL` | – | The service's base URL in a browser, e.g. `https://coder.example.com/@owner/workspace/apps/claude`. When set, responses include `url`, a link to the conversation page. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` or `silent`. At `info` the log shows one line per launch, follow-up, cancel, `claude` exit (turns, cost), push, PR and run end, plus every write request. `debug` adds the GET polls and each git/gh command. |
 
 ## Coder template
 
 The workspace needs `claude` logged in, `git` with an identity and push access, and `gh` logged in for pull requests. Claude Code refuses `--dangerously-skip-permissions` as root, so run the workspace as a normal user.
 
-Expose the runner as a path-based app with the slug `claude-code-runner` (Rakazo hard-codes this slug), shared with the owner only. The owner's Coder token is the only credential Rakazo needs:
+Expose the runner as an app with the slug `claude` (Rakazo hard-codes this slug and calls it on Coder's path route, `/@owner/workspace/apps/claude/...`, which Coder serves for subdomain apps too unless path apps are disabled), shared with the owner only. The owner's Coder token is the only credential Rakazo needs:
 
 ```hcl
-resource "coder_app" "claude_code_runner" {
+resource "coder_app" "claude" {
   agent_id  = coder_agent.main.id
-  slug      = "claude-code-runner"
+  slug      = "claude"
   url       = "http://localhost:4115"
   share     = "owner"
   subdomain = false
   hidden    = true
 }
 
-resource "coder_script" "claude_code_runner" {
+resource "coder_script" "claude_relay" {
   agent_id     = coder_agent.main.id
-  display_name = "Claude Code runner"
+  display_name = "claude-relay"
   run_on_start = true
-  script       = "nohup node /opt/claude-relay/src/index.ts >/tmp/claude-code-runner.log 2>&1 &"
+  script       = "nohup node /opt/claude-relay/src/index.ts >/tmp/claude-relay.log 2>&1 &"
 }
 ```
 
@@ -113,4 +113,4 @@ Every `/conversations` path is also served under `/agents`, the name Rakazo uses
 | `POST /conversations/:id/runs/:runId/cancel` | Stops the run and returns once it has stopped. |
 | `POST /conversations/:id/runs/:runId/messages` | Steers a running run: `{ prompt, images? }` is stored and written to Claude's stdin, and Claude reads it at its next step. `409 not_running` once the run has ended or no longer takes messages. |
 
-Each returns `{ id, title, status, runId, latestRunId, branch?, prUrl?, error?, summary?, url? }` with `status` one of `running`, `finished`, `failed`, `cancelled`. `runId` is the run described (the latest one, or the one asked for); `latestRunId` is always the conversation's latest run. `summary` is Claude's final answer for that run (the text of its last successful `result`, at most 4000 characters). `url` is present only when `APP_URL` is set and points to `GET /ui/conversations/:id`, an HTML page with the whole conversation (all runs). The page follows `GET /ui/conversations/:id/stream` (server-sent events): Claude's events appear as they are printed, a line under the run says what Claude is doing right now and for how long, and the page refreshes itself when a run starts or ends. While a run goes, a message box at the bottom of the page steers it. Its left sidebar lists every conversation; `GET /ui/conversations` shows that list on its own.
+Each returns `{ id, title, status, runId, latestRunId, branch?, prUrl?, error?, summary?, url? }` with `status` one of `running`, `finished`, `failed`, `cancelled`. `runId` is the run described (the latest one, or the one asked for); `latestRunId` is always the conversation's latest run. `summary` is Claude's final answer for that run (the text of its last successful `result`, at most 20 000 characters, which is what Rakazo keeps); a failed run with no answer carries its `error` there too, since Rakazo shows only the summary. `url` is present only when `APP_URL` is set and points to `GET /ui/conversations/:id`, an HTML page with the whole conversation (all runs). The page follows `GET /ui/conversations/:id/stream` (server-sent events): Claude's events appear as they are printed, a line under the run says what Claude is doing right now and for how long, and the page refreshes itself when a run starts or ends. While a run goes, a message box at the bottom of the page steers it. Its left sidebar lists every conversation; `GET /ui/conversations` shows that list on its own.

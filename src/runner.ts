@@ -138,8 +138,11 @@ const STDERR_TAIL = 1_000;
 const CLAUDE_STDERR_KEPT = 64_000;
 /** Longest Claude Code failure text copied into a run's `error`. */
 const MAX_ERROR = 500;
-/** Longest `summary` in a view; the full text stays in the database (`runs.result_text`). */
-const SUMMARY_MAX = 4_000;
+/**
+ * Longest `summary` in a view: what Rakazo keeps of a reply (its `CLOUD_AGENT_SUMMARY_MAX`). The
+ * full text stays in the database (`runs.result_text`).
+ */
+const SUMMARY_MAX = 20_000;
 
 /**
  * Runs one headless Claude Code session per conversation, each in its own checkout, and
@@ -757,6 +760,9 @@ export class ConversationRunner {
 }
 
 function view(conversation: Conversation, run: Run): ConversationView {
+  // Rakazo shows `summary` as the run's outcome and never reads `error`, so a failed run with
+  // no answer reports why it failed there too.
+  const summary = run.summary?.trim() || (run.status === "failed" ? run.error : undefined);
   return {
     id: conversation.id,
     title: conversation.title,
@@ -766,7 +772,7 @@ function view(conversation: Conversation, run: Run): ConversationView {
     ...(conversation.pushed && conversation.branch ? { branch: conversation.branch } : {}),
     ...(conversation.prUrl ? { prUrl: conversation.prUrl } : {}),
     ...(run.error ? { error: run.error } : {}),
-    ...(run.summary ? { summary: cut(run.summary.trim(), SUMMARY_MAX) } : {}),
+    ...(summary ? { summary: cut(summary, SUMMARY_MAX) } : {}),
   };
 }
 

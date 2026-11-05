@@ -70,7 +70,7 @@ The contract has two layers:
 
 ### Transport
 
-- Rakazo reaches the service through Coder's app proxy at `/@<owner>/<workspace>/apps/claude-code-runner/<path>`, authenticated by the workspace owner's Coder token. The app slug **`claude-code-runner` is hard-coded in Rakazo**.
+- Rakazo reaches the service through Coder's app proxy at `/@<owner>/<workspace>/apps/claude/<path>`, authenticated by the workspace owner's Coder token. The app slug **`claude` is hard-coded in Rakazo** (`APP_SLUG` in `coder-cloud-agent.ts`; it was `claude-code-runner` before the fork's commit `51840fb`). The adapter builds the conversation page link itself from that path, so `url` in responses is for other callers.
 - The service itself does no authentication and listens on loopback only, by design: it runs only inside a Coder workspace. Do not add a non-loopback listener without adding authentication.
 - Rakazo treats a non-JSON or code-less error response as "workspace not reachable" and starts the workspace. So **every response from this service must be JSON**, and every error must carry a `code`.
 - Rakazo reads at most 1 MB of a response and times out requests after 30 s.
@@ -112,7 +112,8 @@ interface ConversationView {
   branch?: string;          // only once pushed
   prUrl?: string;
   error?: string;
-  summary?: string;         // the run's final answer: text of its last successful `result`, ≤ 4000 chars
+  summary?: string;         // the run's final answer: text of its last successful `result`, ≤ 20 000 chars
+                            // (Rakazo's CLOUD_AGENT_SUMMARY_MAX); for a failed run without one, its `error`
   url?: string;             // conversation page `${APP_URL}/ui/conversations/:id`; only when APP_URL is set
 }
 ```
@@ -132,6 +133,7 @@ Errors are `{ "code": ... }`, and Rakazo maps them as follows:
 
 - **Agent ids** are chosen by Rakazo: the first 32 hex chars of a SHA-256 of its idempotency key. Launch idempotency is what makes a lost launch response safe to resend.
 - **Runs**: each launch or follow-up creates a new `runId`. Rakazo tracks follow-ups by `runId` and polls `GET /agents/:id/runs/:runId` (the alias), so old runs must stay readable.
+- **What Rakazo shows**: of a view it reads only `id`, `title`, `status`, `runId`, `branch`, `prUrl` and `summary` (`agentSchema` in the adapter); `error`, `latestRunId` and `url` are ignored. Its card and its `cloud_agent_status` tool show `summary` as the run's outcome, and it stores up to 20 000 characters of it. A new run must come with no summary (the previous reply must not linger), and a failed run carries its `error` as the summary so the failure is visible in Rakazo. Rakazo writes its own title from the prompt; ours is a fallback.
 - **Sessions**: runs use `--session-id <uuid>` until Claude has created the session (its `system/init` event), then `--resume <uuid>`, so context carries over. A run where Claude exits before creating it, e.g. refusing to start, leaves the next run to create it.
 - **Repository work**: with `repository`, the agent works in its own clone on branch `agent/<first 12 chars of id>`. When a run finishes successfully, leftover changes are committed with the title as message, the branch is pushed, and with `openPr` one PR is opened (or the existing one reused) via `gh`. Failed or cancelled runs publish nothing.
 - **Restarts**: a run that was `running` when the service stopped is reported as `failed` on the next start. Conversations live only in PostgreSQL (`DB_CONNECTION_STRING`); the checkouts in `RUNNER_DATA_DIR/work/` must survive restarts too.
