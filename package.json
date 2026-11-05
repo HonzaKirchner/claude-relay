@@ -8,12 +8,18 @@
     "node": ">=22.18"
   },
   "scripts": {
-    "start": "node src/index.ts",
+    "start": "node --env-file-if-exists=.env src/index.ts",
     "check": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "db:init": "node --env-file-if-exists=.env scripts/db-init.ts",
+    "db:import": "node --env-file-if-exists=.env scripts/import-files.ts"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
   },
   "devDependencies": {
     "@types/node": "^22.18.0",
+    "@types/pg": "^8.15.6",
     "typescript": "7.0.2",
     "vitest": "4.1.12"
   }

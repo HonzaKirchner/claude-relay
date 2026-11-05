@@ -14,10 +14,10 @@
     "noImplicitOverride": true,
     "resolveJsonModule": true,
     "forceConsistentCasingInFileNames": true,
-    "rootDir": "src",
+    "rootDir": ".",
     "noEmit": true,
     "allowImportingTsExtensions": true,
     "erasableSyntaxOnly": true
   },
-  "include": ["src"]
+  "include": ["src", "scripts", "test", "vitest.config.ts"]
 }
