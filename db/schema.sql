@@ -125,3 +125,16 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 );
 CREATE INDEX IF NOT EXISTS tool_calls_run_idx ON tool_calls (run_id, started_at);
 CREATE INDEX IF NOT EXISTS tool_calls_name_idx ON tool_calls (name);
+
+-- Messages sent to a run while it was going (steering), each written to the running
+-- `claude` process's stdin after the run's prompt. Stored before they are delivered.
+CREATE TABLE IF NOT EXISTS run_messages (
+  id          text PRIMARY KEY,
+  run_id      text NOT NULL REFERENCES runs (id) ON DELETE CASCADE,
+  seq         integer NOT NULL,                -- 1 = the first message after the run's prompt
+  prompt      text NOT NULL,
+  images      jsonb,                           -- request images as sent
+  image_count integer,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (run_id, seq)
+);

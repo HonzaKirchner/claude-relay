@@ -1,8 +1,9 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { ConversationView, ConversationRunner, Image, LaunchRequest, PromptRequest } from "./runner.ts";
+import type { ConversationView, ConversationRunner, Image, LaunchRequest, PromptRequest, RunMessage } from "./runner.ts";
 import { log, since } from "./log.ts";
-import { ConversationBusy } from "./runner.ts";
-import { conversationsPage, transcriptPage } from "./ui.ts";
+import { ConversationBusy, RunNotRunning } from "./runner.ts";
+import type { LiveOp } from "./ui.ts";
+import { LiveRunRenderer, conversationsPage, sidePanels, transcriptPage } from "./ui.ts";
 
 const MAX_BODY_BYTES = 128 * 1024 * 1024;
 const MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
@@ -14,8 +15,17 @@ const CONVERSATION = new RegExp(`^${BASE}/(${ID})$`);
 const RUNS = new RegExp(`^${BASE}/(${ID})/runs$`);
 const RUN = new RegExp(`^${BASE}/(${ID})/runs/(${ID})$`);
 const CANCEL = new RegExp(`^${BASE}/(${ID})/runs/(${ID})/cancel$`);
+const MESSAGES = new RegExp(`^${BASE}/(${ID})/runs/(${ID})/messages$`);
 const UI = new RegExp(`^/ui${BASE}/(${ID})$`);
 const UI_LIST = /^\/ui\/(conversations|agents)(\/?)$/;
+const UI_STREAM = new RegExp(`^/ui${BASE}/(${ID})/stream$`);
+
+/** How long changes to the page are gathered before they are sent together. */
+const STREAM_BATCH_MS = 100;
+/** How often the sidebars (cost, counts, conversation list) are re-sent while a run goes. */
+const STREAM_PANELS_MS = 5_000;
+/** Keeps proxies from closing a quiet stream; the page also treats silence as a lost stream. */
+const STREAM_PING_MS = 15_000;
 
 /** `html` is only for the browser page; everything Rakazo calls stays JSON. */
 type Reply = { status: number; body: unknown; html?: string };
@@ -24,9 +34,16 @@ type Reply = { status: number; body: unknown; html?: string };
 export function createHandler(runner: ConversationRunner) {
   return (request: IncomingMessage, response: ServerResponse) => {
     const started = performance.now();
+    const live = UI_STREAM.exec(new URL(request.url ?? "/", "http://runner").pathname);
+    if (live && request.method === "GET") {
+      stream(runner, live[1]!, request, response);
+      logRequest(request, response.statusCode, since(started));
+      return;
+    }
     route(runner, request)
       .catch((error: unknown): Reply => {
         if (error instanceof ConversationBusy) return { status: 409, body: { code: "busy" } };
+        if (error instanceof RunNotRunning) return { status: 409, body: { code: "not_running" } };
         if (error instanceof InvalidRequest) return { status: 400, body: { code: "invalid" } };
         log.error("request failed", {
           method: request.method,
@@ -75,6 +92,9 @@ async function route(runner: ConversationRunner, request: IncomingMessage): Prom
   if (run && method === "GET") return found(runner.get(run[1]!, run[2]!));
   const cancel = CANCEL.exec(pathname);
   if (cancel && method === "POST") return found(await runner.cancel(cancel[1]!, cancel[2]!));
+  const messages = MESSAGES.exec(pathname);
+  if (messages && method === "POST")
+    return found(await runner.steer(messages[1]!, messages[2]!, promptRequest(await readJson(request))));
   const ui = UI.exec(pathname);
   if (ui && method === "GET") {
     const transcript = await runner.transcript(ui[1]!);
@@ -88,6 +108,117 @@ async function route(runner: ConversationRunner, request: IncomingMessage): Prom
     return { status: 200, body: null, html: conversationsPage(runner.list(), hrefPrefix) };
   }
   return { status: 404, body: { code: "route_not_found" } };
+}
+
+/**
+ * `GET /ui/conversations/:id/stream?run=<runId>&after=<n>`: server-sent events for the open
+ * transcript page, which says which run it shows as running (`run`) and how many of its events
+ * it has (`after`). Sends `patch` ({ seq, ops }) for each batch of new events, and `reload` when
+ * the page is out of date (a run started or ended), after which the stream ends. A page showing
+ * no running run waits here for the next one to start.
+ */
+function stream(runner: ConversationRunner, id: string, request: IncomingMessage, response: ServerResponse) {
+  const conversation = runner.get(id);
+  if (!conversation) {
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end(JSON.stringify({ code: "not_found" }));
+    return;
+  }
+  const params = new URL(request.url ?? "/", "http://runner").searchParams;
+  const pageRun = params.get("run") ?? "";
+  const after = Number(params.get("after") ?? "0");
+  const messagesShown = Number(params.get("messages") ?? "0");
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    // Asks nginx-style proxies not to buffer the stream.
+    "x-accel-buffering": "no",
+  });
+  const send = (event: string, data: unknown) => response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  send("ready", {});
+
+  const timers = new Set<NodeJS.Timeout>();
+  const later = (ms: number, run: () => void) => {
+    const timer = setTimeout(() => {
+      timers.delete(timer);
+      run();
+    }, ms);
+    timers.add(timer);
+    return timer;
+  };
+  let unsubscribe = () => {};
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    unsubscribe();
+    for (const timer of timers) clearTimeout(timer);
+    response.end();
+  };
+  response.on("close", close);
+  const reload = () => {
+    send("reload", {});
+    close();
+  };
+
+  const liveRun = runner.liveRun(id);
+  if (!pageRun) {
+    // The page shows no run going: it only needs to hear when one starts.
+    if (liveRun) return reload();
+    unsubscribe = runner.subscribe(id, (update) => {
+      if (update.type === "start" || update.type === "end") reload();
+    });
+  } else {
+    if (!liveRun || liveRun.runId !== pageRun || !Number.isInteger(after) || after < 0 || after > liveRun.events.length || !Number.isInteger(messagesShown) || messagesShown < 0 || messagesShown > liveRun.messages.length)
+      return reload();
+    const renderer = new LiveRunRenderer(pageRun, liveRun.startedAt);
+    let pending: LiveOp[] = [];
+    let batch: NodeJS.Timeout | undefined;
+    const flush = () => {
+      batch = undefined;
+      if (closed) return;
+      send("patch", { seq: renderer.count, messages: messageCount, ops: [...pending, renderer.activity()] });
+      pending = [];
+    };
+    const take = (event: Parameters<LiveRunRenderer["push"]>[0]) => {
+      for (const op of renderer.push(event)) {
+        // A later re-render of the same element replaces an earlier one still waiting.
+        if (op.op === "replace") pending = pending.filter((item) => item.op !== "replace" || item.id !== op.id);
+        pending.push(op);
+      }
+      batch ??= later(STREAM_BATCH_MS, flush);
+    };
+    let messageCount = messagesShown;
+    const takeMessage = (message: RunMessage) => {
+      messageCount += 1;
+      pending.push(renderer.message(message));
+      batch ??= later(STREAM_BATCH_MS, flush);
+    };
+    liveRun.events.forEach((event, index) => (index < after ? renderer.push(event, false) : take(event)));
+    liveRun.messages.slice(messagesShown).forEach(takeMessage);
+    // Nothing awaits between reading the events and subscribing, so none can slip through.
+    unsubscribe = runner.subscribe(id, (update) => {
+      if (update.type === "event" && update.runId === pageRun) take(update.event);
+      else if (update.type === "message" && update.runId === pageRun) takeMessage(update.message);
+      else if (update.type === "start" || update.type === "end") {
+        if (batch) flush();
+        reload();
+      }
+    });
+    const panels = async () => {
+      const transcript = await runner.transcript(id).catch(() => undefined);
+      if (closed) return;
+      if (transcript) send("patch", { ops: sidePanels(transcript, runner.list()) });
+      later(STREAM_PANELS_MS, panels);
+    };
+    later(STREAM_PANELS_MS, panels);
+  }
+  const ping = () => {
+    if (closed) return;
+    send("ping", {});
+    later(STREAM_PING_MS, ping);
+  };
+  later(STREAM_PING_MS, ping);
 }
 
 function found(view: ConversationView | undefined): Reply {

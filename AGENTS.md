@@ -26,7 +26,7 @@ Use these names in code and the database; use "agent" only where Rakazo's contra
 | `src/index.ts` | Entry point: reads env, loads state, listens on `127.0.0.1:$PORT`. |
 | `src/http.ts` | Routing, request validation, error → status mapping. |
 | `src/runner.ts` | `ConversationRunner`: per-conversation checkout, `claude` process, commit/push/PR, persistence. |
-| `src/ui.ts` | HTML pages served at `/ui/conversations/:id` and `/ui/conversations` (the list). |
+| `src/ui.ts` | HTML pages served at `/ui/conversations/:id` and `/ui/conversations` (the list), and `LiveRunRenderer`, which turns a running run's events into changes to the open page. |
 | `src/db.ts` | `Store`: the PostgreSQL store, the only place conversations, runs, events and tool calls are kept (`db/schema.sql`). Required: the service exits without `DB_CONNECTION_STRING` or a reachable database. |
 | `src/log.ts` | One-line `key=value` logger, filtered by `LOG_LEVEL`. |
 | `src/runner.test.ts` | End-to-end tests over HTTP with fake `claude` and `gh` scripts and a local git origin. | Needs PostgreSQL, see `test/postgres.ts`. |
@@ -84,8 +84,10 @@ The canonical paths start with `/conversations`. Every one of them is also serve
 | `GET /conversations/:id/runs/:runId` | – | A specific run. |
 | `POST /conversations/:id/runs` | `PromptRequest` | Starts a follow-up that resumes the same Claude session. `409 busy` while a run is going. |
 | `GET /ui/conversations/:id` | – | HTML page with the conversation and a sidebar listing every conversation, for people. Rakazo never calls it. |
-| `GET /ui/conversations` | – | HTML page with just the conversation list. Together with the page above, the only non-JSON success responses. |
+| `GET /ui/conversations` | – | HTML page with just the conversation list. |
+| `GET /ui/conversations/:id/stream?run=&after=` | – | Server-sent events for the conversation page: `patch` with HTML changes as the running run prints events, `reload` when a run starts or ends. Fed from memory by `ConversationRunner.subscribe`, not the database. Rakazo never calls it. Together with the two pages above, the only non-JSON success responses. |
 | `POST /conversations/:id/runs/:runId/cancel` | `{}` | Stops the run and **responds only once it has stopped**, with the final state. Cancelling a finished run returns it unchanged. |
+| `POST /conversations/:id/runs/:runId/messages` | `PromptRequest` | Steers the running run: stores the message (`run_messages`), then writes it to `claude`'s stdin. `409 not_running` if the run is not going, was cancelled, or Claude has answered everything and the run is publishing. Used by the conversation page; Rakazo never calls it. |
 
 ```ts
 type Image = { data: string; mimeType: "image/png" | "image/jpeg" | "image/gif" | "image/webp" } | { url: string };
@@ -115,6 +117,7 @@ Errors are `{ "code": ... }`, and Rakazo maps them as follows:
 | 400 | `invalid` | Request rejected, not retried. |
 | 404 | `not_found` | Agent gone, not retried. |
 | 409 | `busy` | Follow-up refused; Rakazo observes the current run instead of resending. |
+| 409 | `not_running` | Steering message refused (only `POST .../messages`, which Rakazo does not call). |
 | 500 | `internal` | Generic failure. |
 | 404 | `route_not_found` | Generic failure. |
 
@@ -127,6 +130,7 @@ Errors are `{ "code": ... }`, and Rakazo maps them as follows:
 - **Restarts**: a run that was `running` when the service stopped is reported as `failed` on the next start. Conversations live only in PostgreSQL (`DB_CONNECTION_STRING`); the checkouts in `RUNNER_DATA_DIR/work/` must survive restarts too.
 - **Workspace lifecycle** (start on demand, retry later) is Rakazo's job, not this service's.
 - **Lost follow-up responses**: upstream's poller never resends a follow-up blindly. It calls `GET /agents/:id` and treats a new `runId` as proof the follow-up was accepted. So the latest run must be visible as soon as `POST /agents/:id/runs` returns.
+- **Steering**: `claude`'s stdin stays open after the prompt so messages can be written to it mid-run. It is closed once Claude has printed a `result` for every message written; if Claude merged a mid-turn message into the turn it was on, results stay behind, so stdin is also closed after `STEER_IDLE_MS` without output following a `result`. Closing stdin is what makes `claude --print` exit, so keep both rules.
 - **Cancel by run**: the poller cancels the run it is tracking. Cancelling an older, already-finished run must return that run unchanged and must not touch a newer one.
 - **`expired`**: the interface also has an `expired` status (agent gone or archived). This service never reports it. Agents and checkouts are kept forever.
 

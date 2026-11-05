@@ -13,6 +13,14 @@ export interface StoredEvent {
   event: ClaudeEvent;
 }
 
+/** A message sent to a run while it was going, to steer it. */
+export interface RunMessage {
+  id: string;
+  prompt: string;
+  imageCount?: number;
+  sentAt: string;
+}
+
 export interface Run {
   id: string;
   status: RunStatus;
@@ -23,6 +31,8 @@ export interface Run {
   stderr?: string;
   startedAt: string;
   finishedAt?: string;
+  /** Messages sent while it was going, oldest first. */
+  messages?: RunMessage[];
 }
 
 export interface Conversation {
@@ -110,6 +120,24 @@ export class Store {
       `SELECT id, conversation_id, status, prompt, image_count, error, stderr, started_at, finished_at
        FROM runs ORDER BY conversation_id, seq`,
     );
+    const messages = await this.pool.query<{
+      id: string;
+      run_id: string;
+      prompt: string;
+      image_count: number | null;
+      created_at: Date;
+    }>("SELECT id, run_id, prompt, image_count, created_at FROM run_messages ORDER BY run_id, seq");
+    const messagesByRun = new Map<string, RunMessage[]>();
+    for (const row of messages.rows) {
+      const list = messagesByRun.get(row.run_id) ?? [];
+      list.push({
+        id: row.id,
+        prompt: row.prompt,
+        ...(row.image_count ? { imageCount: row.image_count } : {}),
+        sentAt: row.created_at.toISOString(),
+      });
+      messagesByRun.set(row.run_id, list);
+    }
     const byId = new Map<string, Conversation>();
     for (const row of conversations.rows) {
       byId.set(row.id, {
@@ -136,6 +164,7 @@ export class Store {
         ...(row.stderr ? { stderr: row.stderr } : {}),
         startedAt: row.started_at.toISOString(),
         ...(row.finished_at ? { finishedAt: row.finished_at.toISOString() } : {}),
+        ...(messagesByRun.has(row.id) ? { messages: messagesByRun.get(row.id)! } : {}),
       });
     }
     return [...byId.values()];
@@ -194,6 +223,26 @@ export class Store {
          ON CONFLICT (id) DO UPDATE SET
            status = EXCLUDED.status, error = EXCLUDED.error, stderr = EXCLUDED.stderr,
            finished_at = EXCLUDED.finished_at`,
+        values,
+      );
+    });
+  }
+
+  /** Stores a message sent to a running run. `seq` counts from 1 within the run. Rejects if the write failed. */
+  saveRunMessage(conversationId: string, runId: string, seq: number, message: RunMessage, images?: unknown[]): Promise<void> {
+    const values = [
+      message.id,
+      runId,
+      seq,
+      text(message.prompt),
+      images?.length ? json(images) : null,
+      message.imageCount ?? null,
+      message.sentAt,
+    ];
+    return this.enqueue(conversationId, async () => {
+      await this.pool.query(
+        `INSERT INTO run_messages (id, run_id, seq, prompt, images, image_count, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         values,
       );
     });

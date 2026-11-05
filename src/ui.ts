@@ -1,4 +1,4 @@
-import type { ConversationSummary, Transcript } from "./runner.ts";
+import type { ConversationSummary, RunMessage, Transcript } from "./runner.ts";
 
 type Block = Record<string, unknown>;
 type TranscriptRun = Transcript["runs"][number];
@@ -10,10 +10,12 @@ const MAX_OUTPUT = 20_000;
  * A self-contained HTML page showing a conversation in the style of the Claude app: prompts as
  * message bubbles, Claude's replies as prose, tool calls as collapsible rows. A sidebar on the
  * left lists every conversation, one on the right sums up this one (status, cost by model, ...).
- * While a run is going, the page fetches itself again and swaps the changing parts in place.
+ * The page follows the conversation over `<page>/stream` (see `LiveRunRenderer`): new events are
+ * appended as they come, and when a run starts or ends the page fetches itself and swaps in.
  */
 export function transcriptPage(transcript: Transcript, conversations: ConversationSummary[] = []): string {
-  const running = transcript.runs.some((run) => run.status === "running");
+  const live = transcript.runs.find((run) => run.status === "running");
+  const running = Boolean(live);
   const runs = transcript.runs.map((run) => renderRun(run)).join("\n");
   return `<!doctype html>
 <html lang="en">
@@ -24,7 +26,7 @@ export function transcriptPage(transcript: Transcript, conversations: Conversati
 <title>${escape(transcript.title)}</title>
 <style>${STYLE}</style>
 </head>
-<body${running ? " data-running" : ""}>
+<body${live ? ` data-run="${escape(live.id)}" data-after="${live.events.length}" data-messages="${live.messages?.length ?? 0}"` : ""}>
 <input type="checkbox" id="toggle-nav" class="toggle" aria-label="Show conversations">
 <input type="checkbox" id="toggle-stats" class="toggle" aria-label="Show details">
 <div class="layout">
@@ -38,6 +40,10 @@ export function transcriptPage(transcript: Transcript, conversations: Conversati
 ${runs}
 </div>
 </main>
+<form class="composer" id="composer" autocomplete="off">
+<div class="composer-box"><textarea name="prompt" rows="1" maxlength="100000" placeholder="Steer Claude while it works…" aria-label="Message to Claude"></textarea><button type="submit" title="Send (Enter)" aria-label="Send">${ICONS.send}</button></div>
+<div class="composer-hint" aria-live="polite">Claude reads it at its next step. Shift+Enter for a new line.</div>
+</form>
 </div>
 <aside class="sidebar right" aria-label="Conversation details">
 <div class="sidebar-head"><span>Details</span><label for="toggle-stats" class="close" title="Close">${ICONS.x}</label></div>
@@ -46,7 +52,7 @@ ${runs}
 </div>
 <label for="toggle-nav" class="fab nav-button" title="Conversations">${ICONS.menu}</label><label for="toggle-stats" class="fab stats-button" title="Details">${ICONS.panel}</label>
 <label class="scrim" for="toggle-nav"></label><label class="scrim stats-scrim" for="toggle-stats"></label>
-${running ? `<script>${LIVE_SCRIPT}</script>` : ""}
+<script>${STREAM_SCRIPT}</script>
 </body>
 </html>`;
 }
@@ -77,7 +83,7 @@ export function conversationsPage(conversations: ConversationSummary[], hrefPref
 <main><p class="empty">${conversations.length ? "Select a conversation." : "No conversations yet."}</p></main>
 </div>
 </div>
-${running ? `<script>${LIVE_SCRIPT}</script>` : ""}
+${running ? `<script>${POLL_SCRIPT}</script>` : ""}
 </body>
 </html>`;
 }
@@ -93,7 +99,9 @@ function conversationList(conversations: ConversationSummary[], currentId?: stri
         `${conversation.runCount} run${conversation.runCount === 1 ? "" : "s"}`,
         conversation.repository ? repoName(conversation.repository) : "",
       ].filter(Boolean);
-      return `<li><a href="${hrefPrefix}${encodeURIComponent(conversation.id)}"${current ? ' class="current" aria-current="page"' : ""}><span class="dot ${conversation.status}" title="${conversation.status}"></span><span class="conv-text"><span class="conv-title">${escape(conversation.title)}</span><span class="conv-meta">${escape(meta.join(" · "))}</span></span></a></li>`;
+      // A finished conversation is the quiet default; anything else is named next to the dot's colour.
+      const label = conversation.status === "finished" ? "" : `<span class="status ${conversation.status}">${escape(capitalize(conversation.status))}</span> · `;
+      return `<li><a href="${hrefPrefix}${encodeURIComponent(conversation.id)}"${current ? ' class="current" aria-current="page"' : ""}><span class="dot ${conversation.status}" title="${conversation.status}"></span><span class="conv-text"><span class="conv-title">${escape(conversation.title)}</span><span class="conv-meta">${label}${escape(meta.join(" · "))}</span></span></a></li>`;
     })
     .join("")}</ul>`;
 }
@@ -328,8 +336,7 @@ function renderRun(run: TranscriptRun): string {
   const time = run.startedAt ? clock(run.startedAt) : "";
   const label = `<div class="run-label">Run ${run.seq} · <span class="status ${run.status}">${run.status}</span>${time ? ` · <time datetime="${escape(run.startedAt)}">${escape(time)}</time>` : ""}</div>`;
   const footer: string[] = [];
-  if (run.status === "running")
-    footer.push(`<div class="working"><span class="spark spin">${ICONS.spark}</span><span class="shimmer">Working…</span></div>`);
+  if (run.status === "running") footer.push(activityLine(run.events, run.startedAt, cwd));
   if (run.status === "cancelled") footer.push(`<div class="notice">${ICONS.stop}Stopped by user</div>`);
   if (run.error)
     footer.push(`<div class="error-card"><div class="error-title">${ICONS.alert}Something went wrong</div><pre>${escape(cap(run.error))}</pre></div>`);
@@ -339,14 +346,212 @@ function renderRun(run: TranscriptRun): string {
 ${label}
 <div class="user-msg"><div class="bubble">${run.prompt !== undefined ? `<div class="prompt">${escape(run.prompt)}</div>` : ""}${images}</div></div>
 <div class="assistant">
-${renderEvents(top, context, run.id)}
+<div class="events" id="events-${escape(run.id)}">${interleave(top, run.messages ?? [], context, run.id)}</div>
 ${footer.join("\n")}
 </div>
 </section>`;
 }
 
+/**
+ * The run's top-level events with the messages sent to it in between, each message placed
+ * before the first event received after it was sent. Event ids are as in `renderEvents`.
+ */
+function interleave(top: StoredEventLike[], messages: RunMessage[], context: Context, runId: string): string {
+  let next = 0;
+  let html = "";
+  top.forEach((stored, index) => {
+    while (next < messages.length && stored.at !== undefined && messages[next]!.sentAt <= stored.at) html += messageBubble(messages[next++]!);
+    html += renderEvent(stored.event as Record<string, unknown>, context, `${runId}-${index}`);
+  });
+  for (; next < messages.length; next++) html += messageBubble(messages[next]!);
+  return html;
+}
+
+/** A message sent to the run while it was going. */
+function messageBubble(message: RunMessage): string {
+  const images = message.imageCount
+    ? `<div class="attachments">${Array.from({ length: message.imageCount }, (_, i) => `<span class="attachment">${ICONS.image}Image ${i + 1}</span>`).join("")}</div>`
+    : "";
+  return `<div class="user-msg steer" id="message-${escape(message.id)}"><div class="bubble"><div class="prompt">${escape(message.prompt)}</div>${images}</div><div class="steer-note">Sent while Claude was working · <time datetime="${escape(message.sentAt)}">${escape(clock(message.sentAt))}</time></div></div>`;
+}
+
 interface StoredEventLike {
+  /** When the runner received the event (ISO). */
+  at?: string;
   event: unknown;
+}
+
+/** One change to the open page: append to an element, or replace one by id. */
+export type LiveOp = { op: "append"; target: string; html: string } | { op: "replace"; id: string; html: string };
+
+/**
+ * Renders a running run's events one at a time as changes to a page that already shows the
+ * first ones. A new top-level event is appended to the run; a tool result or a subagent's event
+ * re-renders the top-level tool call it belongs to. Element ids match `renderRun`'s, so the
+ * page keeps which sections are open.
+ */
+export class LiveRunRenderer {
+  private readonly runId: string;
+  private readonly startedAt: string;
+  private readonly events: StoredEventLike[] = [];
+  private readonly context: Context = { results: new Map(), children: new Map(), cwd: undefined, running: true };
+  /** Each tool call's parent tool call (a subagent's), or null at the top level. */
+  private readonly parents = new Map<string, string | null>();
+  private readonly tools = new Map<string, Block>();
+  private top = 0;
+
+  constructor(runId: string, startedAt: string) {
+    this.runId = runId;
+    this.startedAt = startedAt;
+  }
+
+  /** How many events it has taken so far. */
+  get count() {
+    return this.events.length;
+  }
+
+  /** Takes the run's next event. With `render` false it only learns it (the page already shows it). */
+  push(stored: StoredEventLike, render = true): LiveOp[] {
+    this.events.push(stored);
+    const event = stored.event as Record<string, unknown>;
+    const context = this.context;
+    if (event.type === "system" && event.subtype === "init" && typeof event.cwd === "string") context.cwd ??= event.cwd;
+    const parent = typeof event.parent_tool_use_id === "string" ? event.parent_tool_use_id : null;
+    const touched = new Set<string>();
+    for (const block of blocksOf(event)) {
+      if (block.type === "tool_use" && typeof block.id === "string") {
+        this.parents.set(block.id, parent);
+        this.tools.set(block.id, block);
+      }
+      if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
+        context.results.set(block.tool_use_id, block);
+        touched.add(block.tool_use_id);
+      }
+    }
+    if (parent !== null) {
+      context.children.set(parent, [...(context.children.get(parent) ?? []), stored]);
+      touched.add(parent);
+    }
+    const ops: LiveOp[] = [];
+    if (parent === null) {
+      const index = this.top++;
+      const html = render ? renderEvent(event, context, `${this.runId}-${index}`) : "";
+      if (html) ops.push({ op: "append", target: `events-${this.runId}`, html });
+    }
+    if (!render) return [];
+    const roots = new Set([...touched].map((id) => this.rootOf(id)).filter((id) => id !== undefined));
+    for (const id of roots) ops.push({ op: "replace", id: `tool-${id}`, html: renderTool(this.tools.get(id)!, context) });
+    return ops;
+  }
+
+  /** The line under the run saying what Claude is doing and for how long. */
+  /** A message sent to the run, shown where the run is now. */
+  message(message: RunMessage): LiveOp {
+    return { op: "append", target: `events-${this.runId}`, html: messageBubble(message) };
+  }
+
+  activity(): LiveOp {
+    return { op: "replace", id: "activity", html: activityLine(this.events, this.startedAt, this.context.cwd) };
+  }
+
+  /** The top-level tool call that `id` is, or runs inside of. */
+  private rootOf(id: string): string | undefined {
+    let current = id;
+    for (let depth = 0; depth < 32; depth++) {
+      const parent = this.parents.get(current);
+      if (parent === undefined) return undefined;
+      if (parent === null) return current;
+      current = parent;
+    }
+    return undefined;
+  }
+}
+
+/**
+ * Says what the run is doing right now: the latest tool call still without a result (a
+ * subagent's, when one is working), else that Claude is thinking. Timed from when that began.
+ */
+function activityLine(events: StoredEventLike[], startedAt: string, cwd: string | undefined): string {
+  const pending = new Map<string, { text: string; at?: string }>();
+  let text = "Starting Claude Code";
+  let at: string | undefined;
+  for (const { event: raw, at: received } of events) {
+    const event = raw as Record<string, unknown>;
+    for (const block of blocksOf(event)) {
+      if (block.type === "tool_use" && typeof block.id === "string")
+        pending.set(block.id, { text: activityText(String(block.name ?? "tool"), (block.input ?? {}) as Record<string, unknown>, cwd), ...(received ? { at: received } : {}) });
+      if (block.type === "tool_result" && typeof block.tool_use_id === "string") pending.delete(block.tool_use_id);
+    }
+    if (event.type === "result") {
+      text = "Wrapping up";
+      at = received;
+    } else if (event.type !== "system" || event.subtype === "init") {
+      // Timed from the last thing Claude printed: that is how long it has been quiet.
+      text = "Thinking";
+      at = received;
+    }
+  }
+  const tool = [...pending.values()].at(-1);
+  if (tool && text !== "Wrapping up") ({ text, at } = tool);
+  const now = Date.now();
+  const since = (iso: string | undefined) => {
+    const time = iso ? Date.parse(iso) : NaN;
+    return Number.isFinite(time) ? Math.max(0, now - time) : 0;
+  };
+  const step = since(at ?? startedAt);
+  const total = since(startedAt);
+  return `<div class="working" id="activity" aria-live="polite"><span class="spark spin">${ICONS.spark}</span><span class="shimmer activity-text">${escape(text)}</span><span class="elapsed" data-elapsed="${step}">${timer(step)}</span><span class="total"><span data-elapsed="${total}">${timer(total)}</span> in this run</span></div>`;
+}
+
+/** What a tool call still waiting for its result is doing, in the present tense. */
+function activityText(name: string, input: Record<string, unknown>, cwd: string | undefined): string {
+  const str = (key: string) => (typeof input[key] === "string" ? (input[key] as string) : "");
+  const file = () => relative(str("file_path") || str("notebook_path") || str("path"), cwd);
+  switch (name) {
+    case "Bash":
+      return `Running ${str("description") || oneLine(str("command"))}`.trim();
+    case "Read":
+      return `Reading ${file()}`;
+    case "Edit":
+    case "MultiEdit":
+    case "NotebookEdit":
+      return `Editing ${file()}`;
+    case "Write":
+      return `Writing ${file()}`;
+    case "Grep":
+    case "Glob":
+      return `Searching for ${str("pattern")}`;
+    case "LS":
+      return `Listing ${file()}`;
+    case "WebFetch":
+      return `Fetching ${str("url")}`;
+    case "WebSearch":
+      return `Searching the web for ${str("query")}`;
+    case "Task":
+    case "Agent":
+      return `Subagent: ${str("description") || str("subagent_type") || "working"}`;
+    case "TodoWrite":
+      return "Updating to-dos";
+  }
+  const mcp = /^mcp__(.+?)__(.+)$/.exec(name);
+  return mcp ? `${humanize(mcp[2]!)} (${mcp[1]})` : `Running ${name}`;
+}
+
+/** `75_000` → `1:15`; the page's script counts up in the same format. */
+function timer(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor(seconds / 60) % 60;
+  return hours ? `${hours}:${pad(minutes)}:${pad(seconds % 60)}` : `${minutes}:${pad(seconds % 60)}`;
+}
+
+/** The two sidebars, re-rendered while a run goes so cost, counts and statuses keep up. */
+export function sidePanels(transcript: Transcript, conversations: ConversationSummary[]): LiveOp[] {
+  return [
+    { op: "replace", id: "stats", html: `<div id="stats">${statsPanel(transcript)}</div>` },
+    { op: "replace", id: "conversations", html: `<nav id="conversations">${conversationList(conversations, transcript.id)}</nav>` },
+  ];
 }
 
 interface Context {
@@ -717,14 +922,13 @@ const ICONS = {
   menu: svg('<path d="M4 7h16M4 12h16M4 17h16"/>'),
   panel: svg('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/>'),
   x: svg('<path d="M6 6l12 12M18 6 6 18"/>'),
+  send: svg('<path d="M12 19V5M6 11l6-6 6 6"/>'),
   checkCircle: svg('<circle cx="12" cy="12" r="8"/><path d="m8.5 12 2.5 2.5 4.5-5"/>'),
 };
 
-/** Polls the page while a run is going and swaps the transcript in, keeping scroll and open sections. */
-const LIVE_SCRIPT = `
+/** The conversation list page: fetches itself again while a run is going and swaps the list in. */
+const POLL_SCRIPT = `
 (() => {
-  const nearBottom = () => innerHeight + scrollY >= document.documentElement.scrollHeight - 120;
-  scrollTo(0, document.documentElement.scrollHeight);
   async function tick() {
     let doc;
     try {
@@ -734,19 +938,163 @@ const LIVE_SCRIPT = `
     } catch {
       return setTimeout(tick, 5000);
     }
-    const stick = nearBottom();
-    const open = [...document.querySelectorAll("details[open][id]")].map((d) => d.id);
-    for (const id of ["log", "conversations", "stats"]) {
-      const next = doc.getElementById(id);
-      if (next) document.getElementById(id)?.replaceWith(next);
-    }
-    for (const id of open) document.getElementById(id)?.setAttribute("open", "");
-    document.title = doc.title;
-    if (stick) scrollTo(0, document.documentElement.scrollHeight);
+    const next = doc.getElementById("conversations");
+    if (next) document.getElementById("conversations")?.replaceWith(next);
     if (doc.body.hasAttribute("data-running")) setTimeout(tick, 2000);
-    else document.body.removeAttribute("data-running");
   }
   setTimeout(tick, 2000);
+})();
+`;
+
+/**
+ * The transcript page: follows \`<page>/stream\` (server-sent events). \`patch\` messages append or
+ * replace parts of the page; \`reload\` means a run started or ended, so the page fetches itself
+ * and swaps the changing parts in, then follows the stream again. Open sections and the scroll
+ * position at the bottom are kept. If the stream goes quiet (a proxy buffering it, say), the
+ * page falls back to fetching itself.
+ */
+const STREAM_SCRIPT = `
+(() => {
+  const body = document.body;
+  const root = document.documentElement;
+  const nearBottom = () => innerHeight + scrollY >= root.scrollHeight - 120;
+  const pad = (n) => String(n).padStart(2, "0");
+  const timer = (ms) => {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor(s / 60) % 60;
+    return h ? h + ":" + pad(m) + ":" + pad(s % 60) : m + ":" + pad(s % 60);
+  };
+  const stamp = () => {
+    for (const el of document.querySelectorAll("[data-elapsed]:not([data-base])"))
+      el.dataset.base = String(Date.now() - Number(el.dataset.elapsed));
+  };
+  setInterval(() => {
+    for (const el of document.querySelectorAll("[data-base]")) el.textContent = timer(Date.now() - Number(el.dataset.base));
+  }, 1000);
+  const change = (apply) => {
+    const stick = nearBottom();
+    const open = [...document.querySelectorAll("details[open][id]")].map((d) => d.id);
+    apply();
+    for (const id of open) document.getElementById(id)?.setAttribute("open", "");
+    stamp();
+    if (stick) scrollTo(0, root.scrollHeight);
+  };
+  let source;
+  let retry;
+  let watchdog;
+  let lastReload = 0;
+  const quiet = () => {
+    clearTimeout(watchdog);
+    watchdog = setTimeout(() => restart(), 45000);
+  };
+  const restart = (delay = 0) => {
+    source?.close();
+    clearTimeout(watchdog);
+    clearTimeout(retry);
+    retry = setTimeout(reload, delay);
+  };
+  function connect() {
+    const url = new URL(location.href);
+    url.pathname = url.pathname.replace(/\\/+$/, "") + "/stream";
+    url.search = "";
+    if (body.dataset.run) {
+      url.searchParams.set("run", body.dataset.run);
+      url.searchParams.set("after", body.dataset.after || "0");
+      url.searchParams.set("messages", body.dataset.messages || "0");
+    }
+    source = new EventSource(url);
+    quiet();
+    source.addEventListener("ready", quiet);
+    source.addEventListener("ping", quiet);
+    source.addEventListener("patch", (message) => {
+      quiet();
+      const data = JSON.parse(message.data);
+      change(() => {
+        for (const op of data.ops) {
+          if (op.op === "append") document.getElementById(op.target)?.insertAdjacentHTML("beforeend", op.html);
+          else {
+            const el = document.getElementById(op.id);
+            if (el) el.outerHTML = op.html;
+          }
+        }
+      });
+      if (typeof data.seq === "number") body.dataset.after = String(data.seq);
+      if (typeof data.messages === "number") body.dataset.messages = String(data.messages);
+    });
+    source.addEventListener("reload", () => restart());
+    source.onerror = () => restart(3000);
+  }
+  async function reload() {
+    const wait = lastReload + 1000 - Date.now();
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    lastReload = Date.now();
+    let doc;
+    try {
+      const response = await fetch(location.href, { cache: "no-store", headers: { accept: "text/html" } });
+      if (!response.ok) throw new Error(String(response.status));
+      doc = new DOMParser().parseFromString(await response.text(), "text/html");
+    } catch {
+      return restart(5000);
+    }
+    change(() => {
+      for (const id of ["log", "conversations", "stats"]) {
+        const next = doc.getElementById(id);
+        if (next) document.getElementById(id)?.replaceWith(next);
+      }
+    });
+    document.title = doc.title;
+    for (const name of ["run", "after", "messages"]) {
+      if (doc.body.dataset[name] === undefined) delete body.dataset[name];
+      else body.dataset[name] = doc.body.dataset[name];
+    }
+    connect();
+  }
+  // Sends what is typed to the running run (POST <api>/conversations/:id/runs/:runId/messages).
+  const form = document.getElementById("composer");
+  const field = form.elements.prompt;
+  const hint = form.querySelector(".composer-hint");
+  const defaultHint = hint.textContent;
+  const fit = () => {
+    field.style.height = "auto";
+    field.style.height = Math.min(field.scrollHeight, 200) + "px";
+  };
+  field.addEventListener("input", fit);
+  field.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      form.requestSubmit();
+    }
+  });
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const prompt = field.value;
+    if (!prompt.trim() || !body.dataset.run || form.classList.contains("sending")) return;
+    const url = new URL(location.href);
+    url.pathname = url.pathname.replace(/\\/ui\\/(?:conversations|agents)\\/([^/]+)\\/?$/, (_, id) => "/conversations/" + id + "/runs/" + encodeURIComponent(body.dataset.run) + "/messages");
+    url.search = "";
+    form.classList.add("sending");
+    hint.classList.remove("error");
+    try {
+      const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt }) });
+      if (!response.ok) {
+        const code = (await response.json().catch(() => ({}))).code;
+        throw new Error(code === "not_running" ? "This run no longer takes messages. Send a follow-up once it has ended." : "Could not send the message (" + (code || response.status) + ").");
+      }
+      field.value = "";
+      fit();
+      hint.textContent = defaultHint;
+    } catch (error) {
+      hint.textContent = error.message;
+      hint.classList.add("error");
+    } finally {
+      form.classList.remove("sending");
+    }
+  });
+
+  stamp();
+  if (body.dataset.run) scrollTo(0, root.scrollHeight);
+  connect();
 })();
 `;
 
@@ -755,7 +1103,7 @@ const STYLE = `
     color-scheme: light;
     --bg: #faf9f5; --surface: #ffffff; --bubble: #f0eee6; --border: #e5e2d9; --border-strong: #d6d2c6;
     --text: #141413; --text-2: #3d3d3a; --muted: #73726c; --accent: #d97757; --accent-soft: rgba(217, 119, 87, .12);
-    --ok: #3f7d4e; --err: #b53333; --err-soft: #fbeceb; --code-bg: #f5f4ee; --inline-code: #f0eee6;
+    --ok: #2e8540; --err: #c62828; --run: #1f6fd1; --run-soft: rgba(31, 111, 209, .18); --err-soft: #fbeceb; --code-bg: #f5f4ee; --inline-code: #f0eee6;
     --add-bg: #e6f4e8; --add-fg: #1f5f2d; --del-bg: #fbe9e9; --del-fg: #8f2424; --link: #2c5fb3;
     --sidebar: #f5f4ed; --hover: rgba(20, 20, 19, .05); --selected: rgba(20, 20, 19, .08); --shadow: 0 10px 40px rgba(0, 0, 0, .18);
     --serif: "Copernicus", "Tiempos Text", "Iowan Old Style", "Charter", Georgia, "Times New Roman", serif;
@@ -767,7 +1115,7 @@ const STYLE = `
       color-scheme: dark;
       --bg: #262624; --surface: #30302e; --bubble: #141413; --border: #3a3a37; --border-strong: #4a4a46;
       --text: #f5f4ef; --text-2: #c2c0b6; --muted: #9c9a92; --accent: #d97757; --accent-soft: rgba(217, 119, 87, .16);
-      --ok: #7ec48f; --err: #f08b8b; --err-soft: #3a2422; --code-bg: #1f1e1d; --inline-code: #1f1e1d;
+      --ok: #6fcf86; --err: #ff7b7b; --run: #6aa8ff; --run-soft: rgba(106, 168, 255, .22); --err-soft: #3a2422; --code-bg: #1f1e1d; --inline-code: #1f1e1d;
       --sidebar: #1f1e1d; --hover: rgba(255, 255, 255, .05); --selected: rgba(255, 255, 255, .09); --shadow: 0 10px 40px rgba(0, 0, 0, .5);
       --add-bg: #1f3324; --add-fg: #a6dcb2; --del-bg: #3d2223; --del-fg: #f2b0b0; --link: #8db4f5;
     }
@@ -781,7 +1129,7 @@ const STYLE = `
 
   .layout { display: grid; grid-template-columns: 320px minmax(0, 1fr) 360px; min-height: 100vh; }
   .layout.index { grid-template-columns: 320px minmax(0, 1fr); }
-  .center { min-width: 0; }
+  .center { min-width: 0; display: flex; flex-direction: column; min-height: 100vh; }
   .toggle { position: absolute; opacity: 0; pointer-events: none; }
   .sidebar { position: sticky; top: 0; height: 100vh; overflow-y: auto; background: var(--sidebar); font-size: 14px; display: flex; flex-direction: column; }
   .sidebar.left { border-right: 1px solid var(--border); }
@@ -795,14 +1143,18 @@ const STYLE = `
   .conversations a { display: flex; gap: 10px; align-items: flex-start; padding: 7px 10px; border-radius: 8px; color: var(--text-2); }
   .conversations a:hover { background: var(--hover); text-decoration: none; }
   .conversations a.current { background: var(--selected); color: var(--text); }
-  .conversations .dot { margin-top: 7px; }
+  .conversations .dot { margin-top: 6px; }
+  .conv-meta .status { font-weight: 600; }
   .conv-text { display: flex; flex-direction: column; min-width: 0; }
   .conv-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .conv-meta { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; display: inline-block; background: var(--muted); }
-  .dot.running { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); animation: pulse 1.6s ease-in-out infinite; }
-  .dot.finished { background: var(--ok); } .dot.failed { background: var(--err); } .dot.cancelled { background: var(--muted); }
-  @keyframes pulse { 50% { box-shadow: 0 0 0 5px transparent; } }
+  /* Each status differs in shape as well as colour: spinning ring, solid dot, dot with a halo, hollow ring. */
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; display: inline-block; box-sizing: border-box; background: var(--muted); }
+  .dot.running { background: transparent; border: 2px solid var(--run-soft); border-top-color: var(--run); border-right-color: var(--run); animation: spin .9s linear infinite; }
+  .dot.finished { background: var(--ok); }
+  .dot.failed { background: var(--err); box-shadow: 0 0 0 3px var(--err-soft); }
+  .dot.cancelled { background: transparent; border: 2px solid var(--muted); }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   #stats { padding: 0 16px 24px; display: flex; flex-direction: column; gap: 14px; }
   .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
@@ -870,10 +1222,11 @@ const STYLE = `
   .spark { color: var(--accent); display: inline-flex; width: 20px; height: 20px; flex: none; }
   .spark svg { width: 100%; height: 100%; }
 
-  main { max-width: 768px; margin: 0 auto; padding: 24px 16px 96px; }
+  main { flex: 1; width: 100%; max-width: 768px; margin: 0 auto; padding: 24px 16px 96px; }
+  body[data-run] main { padding-bottom: 24px; }
   .run { padding-top: 20px; }
   .run-label { text-align: center; font-size: 12px; color: var(--muted); margin: 8px 0 16px; }
-  .status.running { color: var(--accent); } .status.finished { color: var(--ok); } .status.failed, .status.cancelled { color: var(--err); }
+  .status.running { color: var(--run); } .status.finished { color: var(--ok); } .status.failed { color: var(--err); } .status.cancelled { color: var(--muted); }
 
   .user-msg { display: flex; justify-content: flex-end; margin-bottom: 20px; }
   .bubble { background: var(--bubble); border-radius: 16px; padding: 10px 16px; max-width: min(85%, 600px); }
@@ -950,7 +1303,25 @@ const STYLE = `
   .error-title { display: flex; align-items: center; gap: 6px; color: var(--err); font-weight: 600; font-size: 14px; }
   .error-card pre { margin: 6px 0 0; font: 12.5px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-2); max-height: 300px; overflow: auto; }
 
-  .working { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 14px; color: var(--muted); }
+  .events { display: flex; flex-direction: column; gap: 6px; }
+  .user-msg.steer { flex-direction: column; align-items: flex-end; gap: 4px; margin: 10px 0 12px; }
+  .steer-note { font-size: 12px; color: var(--muted); }
+
+  /* Shown only while a run is going (the page then has data-run). */
+  .composer { display: none; position: sticky; bottom: 0; z-index: 2; max-width: 768px; margin: 0 auto; padding: 0 16px 16px; background: linear-gradient(transparent, var(--bg) 24px); }
+  body[data-run] .composer { display: block; }
+  .composer-box { display: flex; align-items: flex-end; gap: 8px; background: var(--surface); border: 1px solid var(--border-strong); border-radius: 16px; padding: 8px 8px 8px 14px; box-shadow: 0 4px 20px rgba(0, 0, 0, .08); }
+  .composer-box:focus-within { border-color: var(--accent); }
+  .composer textarea { flex: 1; min-width: 0; resize: none; border: 0; outline: 0; background: transparent; color: var(--text); font: 15px/1.5 var(--sans); padding: 4px 0; max-height: 200px; }
+  .composer button { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border: 0; border-radius: 10px; background: var(--accent); color: #fff; cursor: pointer; }
+  .composer button .icon { width: 18px; height: 18px; }
+  .composer.sending button { opacity: .5; cursor: progress; }
+  .composer-hint { font-size: 12px; color: var(--muted); padding: 6px 4px 0; }
+  .composer-hint.error { color: var(--err); }
+  .working { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 14px; color: var(--muted); min-width: 0; }
+  .activity-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .working .elapsed, .working .total { flex: none; font-variant-numeric: tabular-nums; }
+  .working .total { margin-left: auto; font-size: 12.5px; }
   .spark.spin svg { animation: spin 2.4s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .shimmer { background: linear-gradient(90deg, var(--muted) 30%, var(--text) 50%, var(--muted) 70%); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: shimmer 2s linear infinite; }

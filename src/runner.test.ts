@@ -17,14 +17,23 @@ process.env.LOG_LEVEL ??= "silent";
 
 const REPOSITORY = "https://github.com/example/demo";
 
-// Stands in for Claude Code: reads one stream-json user message, then behaves as the prompt says.
+// Stands in for Claude Code: reads stream-json user messages line by line, behaves as the first
+// one says, and exits once stdin is closed (and nothing else keeps it going).
 const FAKE_CLAUDE = `
 const fs = require("node:fs");
 fs.appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify(process.argv.slice(2)) + "\\n");
-let input = "";
-process.stdin.on("data", (chunk) => (input += chunk));
-process.stdin.on("end", () => {
-  const text = JSON.parse(input.trim()).message.content[0].text;
+const say = (event) => console.log(JSON.stringify(event));
+const reply = (text) => say({ type: "assistant", message: { content: [{ type: "text", text }] } });
+let first = true;
+let onMessage = () => undefined;
+require("node:readline").createInterface({ input: process.stdin }).on("line", (line) => {
+  if (!line.trim()) return;
+  const text = JSON.parse(line).message.content[0].text;
+  if (!first) return onMessage(text);
+  first = false;
+  start(text);
+});
+function start(text) {
   // Like Claude Code refusing --dangerously-skip-permissions as root: no session, no events.
   if (text.includes("refuse")) {
     console.error("--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons");
@@ -32,6 +41,48 @@ process.stdin.on("end", () => {
   }
   console.log(JSON.stringify({ type: "system", subtype: "init" }));
   if (text.includes("hang")) return setInterval(() => undefined, 1000);
+  // Prints a tool call, then waits for the test to create the gate file before finishing it.
+  // Takes a message sent mid-turn into the turn it is on: one result for both.
+  if (text.includes("merge")) {
+    reply("Working on it");
+    onMessage = (steer) => {
+      reply("Steered: " + steer);
+      say({ type: "result", subtype: "success", is_error: false });
+    };
+    return;
+  }
+  // Answers every message with a turn of its own, the first only once the gate file exists.
+  if (text.includes("turns")) {
+    const queue = [];
+    let busy = true;
+    const answer = (message) => {
+      reply("Echo: " + message);
+      say({ type: "result", subtype: "success", is_error: false });
+    };
+    onMessage = (message) => (busy ? queue.push(message) : answer(message));
+    const wait = setInterval(() => {
+      if (!fs.existsSync(process.env.FAKE_CLAUDE_GATE)) return;
+      clearInterval(wait);
+      answer("first");
+      busy = false;
+      queue.splice(0).forEach(answer);
+    }, 20);
+    return;
+  }
+  if (text.includes("stream")) {
+    say({ type: "assistant", message: { content: [
+      { type: "text", text: "Looking **around**" },
+      { type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "npm test", description: "Run the tests" } },
+    ] } });
+    const wait = setInterval(() => {
+      if (!fs.existsSync(process.env.FAKE_CLAUDE_GATE)) return;
+      clearInterval(wait);
+      say({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "all 12 passed" }] } });
+      say({ type: "assistant", message: { content: [{ type: "text", text: "Tests pass." }] } });
+      say({ type: "result", subtype: "success", is_error: false, total_cost_usd: 0.1 });
+    }, 20);
+    return;
+  }
   if (text.includes("fail")) {
     console.log(JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true }));
     process.exit(1);
@@ -41,7 +92,7 @@ process.stdin.on("end", () => {
     type: "result", subtype: "success", is_error: false, total_cost_usd: 0.25,
     modelUsage: { "claude-opus-5-5": { inputTokens: 1200, outputTokens: 300, costUSD: 0.25 } },
   }));
-});
+}
 `;
 
 const FAKE_GH = `
@@ -89,10 +140,12 @@ async function start(publicUrl?: string) {
     dataDir: path.join(dir, "data"),
     claudeCommand: script("claude", FAKE_CLAUDE),
     ghCommand: script("gh", FAKE_GH),
+    steerIdleMs: 300,
     env: {
       ...process.env,
       ...identity,
       FAKE_CLAUDE_LOG: path.join(dir, "claude.log"),
+      FAKE_CLAUDE_GATE: path.join(dir, "gate"),
       // Clone the example repository from a local origin instead of the network.
       GIT_CONFIG_COUNT: "1",
       GIT_CONFIG_KEY_0: `url.${origin}.insteadOf`,
@@ -128,6 +181,44 @@ async function sql(text: string, values: unknown[] = []) {
   }
 }
 
+interface Message {
+  event: string;
+  data: { seq?: number; messages?: number; ops?: Array<{ op: string; id?: string; target?: string; html: string }> };
+}
+
+/** Opens the page's event stream; `next` resolves with each message in turn. */
+async function openStream(pathname: string) {
+  const response = await fetch(`${base}${pathname}`);
+  const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader();
+  let buffered = "";
+  return {
+    response,
+    async next(): Promise<Message | undefined> {
+      for (;;) {
+        const end = buffered.indexOf("\n\n");
+        if (end >= 0) {
+          const frame = buffered.slice(0, end);
+          buffered = buffered.slice(end + 2);
+          const field = (name: string) => frame.split("\n").find((line) => line.startsWith(`${name}: `))?.slice(name.length + 2);
+          return { event: field("event")!, data: JSON.parse(field("data") ?? "{}") };
+        }
+        const { value, done } = await reader.read();
+        if (done) return undefined;
+        buffered += value;
+      }
+    },
+    /** Reads messages until one matches. */
+    async until(match: (message: Message) => boolean): Promise<Message> {
+      for (;;) {
+        const message = await this.next();
+        if (!message) throw new Error("stream ended");
+        if (match(message)) return message;
+      }
+    },
+    close: () => reader.cancel(),
+  };
+}
+
 /** The arguments of every `claude` invocation so far, in order. */
 function claudeCalls() {
   return readFileSync(path.join(dir, "claude.log"), "utf8")
@@ -160,7 +251,7 @@ beforeEach(async () => {
   const setup = new Store(inject("databaseUrl"));
   await setup.migrate();
   await setup.close();
-  await sql("TRUNCATE conversations, runs, events, tool_calls");
+  await sql("TRUNCATE conversations, runs, run_messages, events, tool_calls");
   await start();
 });
 
@@ -363,6 +454,125 @@ describe("claude code runner", () => {
     });
     expect((await call("GET", "/conversations/lost")).status).toBe(404);
     expect(() => claudeCalls()).toThrow();
+  });
+
+  it("streams a running run's events to the conversation page", async () => {
+    const launched = await call("PUT", "/conversations/live", { prompt: "stream please" });
+    const runId = launched.body.runId!;
+
+    // A page that shows no running run is told to reload; so is one with a stale run.
+    const idle = await openStream("/ui/conversations/live/stream");
+    expect(idle.response.headers.get("content-type")).toContain("text/event-stream");
+    expect((await idle.next())?.event).toBe("ready");
+    expect((await idle.next())?.event).toBe("reload");
+    expect(await idle.next()).toBeUndefined();
+    const stale = await openStream("/ui/agents/live/stream?run=old&after=0");
+    await stale.until((message) => message.event === "reload");
+
+    // The page carries the run it shows as running and how many events it has.
+    const html = await (await fetch(`${base}/ui/conversations/live`)).text();
+    expect(html).toContain(`data-run="${runId}"`);
+    expect(html).toContain(`id="events-${runId}"`);
+
+    const live = await openStream(`/ui/conversations/live/stream?run=${runId}&after=0`);
+    const ops = [];
+    for (;;) {
+      const message = await live.until((item) => item.event === "patch");
+      ops.push(...message.data.ops!);
+      if (ops.some((op) => op.op === "append" && op.html.includes('id="tool-toolu_1"'))) break;
+    }
+    expect(ops.find((op) => op.op === "append" && op.html.includes("Looking"))).toMatchObject({
+      target: `events-${runId}`,
+      html: expect.stringContaining("<strong>around</strong>"),
+    });
+    expect(ops.findLast((op) => op.id === "activity")?.html).toContain("Running Run the tests");
+
+    writeFileSync(path.join(dir, "gate"), "");
+    const done = [];
+    for (;;) {
+      const message = await live.next();
+      if (!message || message.event === "reload") break;
+      if (message.event === "patch") done.push(...message.data.ops!);
+    }
+    expect(done.find((op) => op.op === "replace" && op.id === "tool-toolu_1")?.html).toContain("all 12 passed");
+    expect(done.some((op) => op.op === "append" && op.html.includes("Tests pass."))).toBe(true);
+    await runner.idle();
+
+    // Once the run has ended the stream has nothing to replay: the page reloads.
+    const after = await openStream(`/ui/conversations/live/stream?run=${runId}&after=2`);
+    await after.until((message) => message.event === "reload");
+    // A page showing no running run waits, and reloads when a follow-up starts.
+    const waiting = await openStream("/ui/conversations/live/stream");
+    expect((await waiting.next())?.event).toBe("ready");
+    rmSync(path.join(dir, "gate"));
+    const followup = await call("POST", "/conversations/live/runs", { prompt: "hang" });
+    expect((await waiting.next())?.event).toBe("reload");
+    await call("POST", `/conversations/live/runs/${followup.body.runId}/cancel`);
+
+    expect((await fetch(`${base}/ui/conversations/missing/stream`)).status).toBe(404);
+  });
+
+  it("steers a running run with messages, stored before they are sent", async () => {
+    const launched = await call("PUT", "/conversations/steered", { prompt: "merge please" });
+    const runId = launched.body.runId!;
+    const live = await openStream(`/ui/conversations/steered/stream?run=${runId}&after=0&messages=0`);
+    await live.until((message) => message.event === "patch" && message.data.ops!.some((op) => op.html.includes("Working on it")));
+    const sent = await call("POST", `/conversations/steered/runs/${runId}/messages`, { prompt: "Use pnpm, not npm" });
+    expect(sent).toMatchObject({ status: 200, body: { status: "running", runId } });
+
+    // The page shows the message as soon as it is sent.
+    const patch = await live.until((message) => message.event === "patch" && message.data.ops!.some((op) => op.html.includes("user-msg steer")));
+    expect(patch.data.messages).toBe(1);
+    expect(patch.data.ops!.find((op) => op.html.includes("user-msg steer"))?.html).toContain("Use pnpm, not npm");
+
+    // Claude took it into the turn it was on; with no second result, stdin closes once it is quiet.
+    await runner.idle();
+    expect((await call("GET", "/conversations/steered")).body.status).toBe("finished");
+    expect(await sql("SELECT seq, prompt FROM run_messages WHERE run_id = $1", [runId])).toEqual([
+      { seq: 1, prompt: "Use pnpm, not npm" },
+    ]);
+    const texts = await sql("SELECT content->0->>'text' AS text FROM events WHERE run_id = $1 AND type = 'assistant' ORDER BY seq", [runId]);
+    expect(texts.map((row) => row.text)).toEqual(["Working on it", "Steered: Use pnpm, not npm"]);
+
+    // Kept across a restart, and shown in the transcript between the events around it.
+    await restart();
+    const html = await (await fetch(`${base}/ui/conversations/steered`)).text();
+    expect(html.indexOf("Working on it")).toBeLessThan(html.indexOf("Use pnpm, not npm"));
+    expect(html.indexOf("Use pnpm, not npm")).toBeLessThan(html.indexOf("Steered: Use pnpm"));
+    expect(html).toContain("Sent while Claude was working");
+    // The page's scripts are built in template strings, where a lost backslash breaks them.
+    const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]!);
+    expect(scripts.length).toBeGreaterThan(0);
+    for (const source of scripts) expect(() => new Function(source)).not.toThrow();
+
+    // Only a running run takes messages.
+    expect(await call("POST", `/conversations/steered/runs/${runId}/messages`, { prompt: "late" })).toEqual({
+      status: 409,
+      body: { code: "not_running" },
+    });
+    expect((await call("POST", "/conversations/steered/runs/nope/messages", { prompt: "x" })).status).toBe(404);
+    expect((await call("POST", `/agents/steered/runs/${runId}/messages`, { prompt: " " })).status).toBe(400);
+  });
+
+  it("keeps stdin open until Claude has answered every message", async () => {
+    const launched = await call("PUT", "/conversations/turns", { prompt: "turns" });
+    const runId = launched.body.runId!;
+    for (const prompt of ["second", "third"])
+      expect((await call("POST", `/conversations/turns/runs/${runId}/messages`, { prompt })).status).toBe(200);
+    writeFileSync(path.join(dir, "gate"), "");
+    await runner.idle();
+    expect((await call("GET", "/conversations/turns")).body.status).toBe("finished");
+    const texts = await sql("SELECT content->0->>'text' AS text FROM events WHERE run_id = $1 AND type = 'assistant' ORDER BY seq", [runId]);
+    expect(texts.map((row) => row.text)).toEqual(["Echo: first", "Echo: second", "Echo: third"]);
+    expect(await sql("SELECT count(*)::int AS n FROM events WHERE run_id = $1 AND type = 'result'", [runId])).toEqual([{ n: 3 }]);
+  });
+
+  it("refuses messages to a cancelled run", async () => {
+    const launched = await call("PUT", "/conversations/stopped", { prompt: "hang" });
+    await call("POST", `/conversations/stopped/runs/${launched.body.runId}/cancel`);
+    expect((await call("POST", `/conversations/stopped/runs/${launched.body.runId}/messages`, { prompt: "x" })).body).toEqual({
+      code: "not_running",
+    });
   });
 
   it("validates requests and reports unknown conversations", async () => {

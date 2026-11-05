@@ -1,12 +1,13 @@
 import type { ChildProcess } from "node:child_process";
+import type { Writable } from "node:stream";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
-import type { ClaudeEvent, Conversation, Run, RunStatus, Store, StoredEvent } from "./db.ts";
+import type { ClaudeEvent, Conversation, Run, RunMessage, RunStatus, Store, StoredEvent } from "./db.ts";
 import { log, since } from "./log.ts";
 
-export type { RunStatus } from "./db.ts";
+export type { RunMessage, RunStatus } from "./db.ts";
 
 export type Image = { data: string; mimeType: string } | { url: string };
 
@@ -69,11 +70,63 @@ export interface RunnerOptions {
   env?: NodeJS.ProcessEnv;
   /** The service's base URL as seen from a browser (through Coder's app proxy). */
   publicUrl?: string;
+  /** See `STEER_IDLE_MS`; tests shorten it. */
+  steerIdleMs?: number;
 }
+
+/** What a run going right now has printed so far. Held in memory only while it runs. */
+export interface LiveRun {
+  runId: string;
+  startedAt: string;
+  events: StoredEvent[];
+  /** Messages sent to it so far, as in `Run.messages`. */
+  messages: RunMessage[];
+}
+
+/**
+ * Pushed to `subscribe` listeners as it happens: each stream-json line of the running run, and
+ * the start and end of a run. `end` comes once the run's outcome and every event are stored.
+ */
+export type LiveUpdate =
+  | { type: "event"; runId: string; seq: number; event: StoredEvent }
+  | { type: "message"; runId: string; message: RunMessage }
+  | { type: "start"; runId: string }
+  | { type: "end"; runId: string };
 
 export class ConversationBusy extends Error {}
 
+/** A message was sent to a run that is not going, or no longer takes messages (it is publishing). */
+export class RunNotRunning extends Error {}
+
+/**
+ * The running `claude` process's stdin. It stays open after the prompt so messages can be sent
+ * while the run goes, and is closed once Claude has answered everything it was sent: that is
+ * what makes `claude --print` exit.
+ */
+interface Input {
+  runId: string;
+  /** Takes messages. False once stdin is closed, or `claude` has exited. */
+  open: boolean;
+  stdin?: Writable;
+  /** Lines for stdin sent before `claude` started; written when it does. */
+  queued: string[];
+  /** Messages being stored; stdin is not closed under them. */
+  storing: number;
+  /** User messages written to stdin, the prompt included. */
+  written: number;
+  /** `result` events Claude has printed. */
+  results: number;
+  idle?: NodeJS.Timeout;
+}
+
 const KILL_GRACE_MS = 10_000;
+/**
+ * After a `result`, with fewer results than messages sent, how long Claude may print nothing
+ * before stdin is closed anyway. Claude may have taken a message sent mid-turn into the turn it
+ * was on rather than answering it with a turn of its own; then no further result comes, and
+ * without this the run would never end. Closing early only means later messages are refused.
+ */
+const STEER_IDLE_MS = 15_000;
 /** How much of a failed git/gh command's stderr goes into the log. */
 const STDERR_TAIL = 1_000;
 /** How much of Claude Code's stderr is stored with a run. */
@@ -96,6 +149,9 @@ export class ConversationRunner {
   private readonly children = new Map<string, ChildProcess>();
   private readonly active = new Map<string, Promise<void>>();
   private readonly cancelled = new Set<string>();
+  private readonly live = new Map<string, LiveRun>();
+  private readonly inputs = new Map<string, Input>();
+  private readonly listeners = new Map<string, Set<(update: LiveUpdate) => void>>();
 
   constructor(options: RunnerOptions) {
     this.options = options;
@@ -211,6 +267,116 @@ export class ConversationRunner {
     return this.view(conversation, run);
   }
 
+  /**
+   * Sends a message to the running run: stored first, then written to Claude's stdin (or held
+   * until `claude` starts). Claude reads it when it next takes input. Refused once the run has
+   * ended or Claude has answered everything and the run is publishing.
+   */
+  async steer(id: string, runId: string, request: PromptRequest): Promise<ConversationView | undefined> {
+    const conversation = this.conversations.get(id);
+    const run = conversation?.runs.find((item) => item.id === runId);
+    if (!conversation || !run) return undefined;
+    const input = this.inputs.get(id);
+    if (run.status !== "running" || input?.runId !== runId || !input.open || this.cancelled.has(runId))
+      throw new RunNotRunning();
+    const message: RunMessage = {
+      id: randomUUID(),
+      prompt: request.prompt,
+      ...(request.images?.length ? { imageCount: request.images.length } : {}),
+      sentAt: new Date().toISOString(),
+    };
+    // Shown (and counted) only once stored. Writes are applied in order, so these appends are too.
+    const seq = (run.messages?.length ?? 0) + input.storing + 1;
+    input.storing += 1;
+    try {
+      await this.store.saveRunMessage(id, runId, seq, message, request.images);
+    } catch (error) {
+      log.error("could not store the message, not sent", {
+        conversation: id,
+        run: runId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    } finally {
+      input.storing -= 1;
+    }
+    (run.messages ??= []).push(message);
+    const line = `${JSON.stringify(userMessage(request))}\n`;
+    if (input.stdin && input.open) {
+      input.stdin.write(line);
+      input.written += 1;
+    } else if (!input.stdin && input.open) input.queued.push(line);
+    // Only if `claude` exited while the message was being stored.
+    else log.warn("message stored but claude had already exited", { conversation: id, run: runId });
+    this.live.get(id)?.messages.push(message);
+    this.emit(id, { type: "message", runId, message });
+    log.info("message sent to run", { conversation: id, run: runId, seq, images: request.images?.length });
+    this.maybeCloseInput(input);
+    return this.view(conversation, run);
+  }
+
+  /**
+   * Closes stdin once every message has its result (and none is being stored), so `claude`
+   * exits. With fewer results than messages it waits for Claude to go quiet (`STEER_IDLE_MS`).
+   */
+  private maybeCloseInput(input: Input) {
+    if (!input.open || !input.stdin || input.storing || !input.results) return;
+    if (input.results >= input.written) return this.closeInput(input);
+    if (!input.idle) this.armIdle(input);
+  }
+
+  private armIdle(input: Input) {
+    clearTimeout(input.idle);
+    input.idle = setTimeout(() => {
+      input.idle = undefined;
+      if (input.storing) return this.armIdle(input);
+      log.info("claude quiet with messages unanswered, closing its input", { run: input.runId });
+      this.closeInput(input);
+    }, this.options.steerIdleMs ?? STEER_IDLE_MS);
+    input.idle.unref();
+  }
+
+  private closeInput(input: Input) {
+    clearTimeout(input.idle);
+    input.idle = undefined;
+    input.open = false;
+    input.stdin?.end();
+  }
+
+  /**
+   * The conversation's running run with every event it has printed so far, which may be ahead
+   * of the database (event writes are queued). Undefined once the run has an outcome.
+   */
+  liveRun(id: string): LiveRun | undefined {
+    const live = this.live.get(id);
+    const run = this.conversations.get(id)?.runs.at(-1);
+    return live && run?.id === live.runId && run.status === "running" ? live : undefined;
+  }
+
+  /** Calls `listener` with every live update of the conversation until the returned function is called. */
+  subscribe(id: string, listener: (update: LiveUpdate) => void): () => void {
+    let set = this.listeners.get(id);
+    if (!set) this.listeners.set(id, (set = new Set()));
+    set.add(listener);
+    return () => {
+      set.delete(listener);
+      if (!set.size) this.listeners.delete(id);
+    };
+  }
+
+  private emit(id: string, update: LiveUpdate) {
+    for (const listener of this.listeners.get(id) ?? []) {
+      try {
+        listener(update);
+      } catch (error) {
+        log.error("live listener failed", {
+          conversation: id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
   /** Waits for every running conversation and pending database write; tests use it to observe finished runs. */
   async idle() {
     await Promise.all(this.active.values());
@@ -230,12 +396,17 @@ export class ConversationRunner {
       startedAt: new Date().toISOString(),
     };
     conversation.runs.push(run);
+    // Before anything awaits, so a page showing the run as running always finds it live.
+    this.live.set(conversation.id, { runId: run.id, startedAt: run.startedAt, events: [], messages: [] });
+    this.inputs.set(conversation.id, { runId: run.id, open: true, queued: [], storing: 0, written: 0, results: 0 });
     const seq = conversation.runs.length;
     try {
       if (seq === 1) await this.store.saveConversation(conversation);
       await this.store.saveRun(conversation.id, seq, run, request.images);
     } catch (error) {
       conversation.runs.pop();
+      this.live.delete(conversation.id);
+      this.inputs.delete(conversation.id);
       if (seq === 1) this.conversations.delete(conversation.id);
       log.error("could not store the new run, nothing started", {
         conversation: conversation.id,
@@ -257,6 +428,7 @@ export class ConversationRunner {
       this.cancelled.delete(run.id);
     });
     this.active.set(conversation.id, work);
+    this.emit(conversation.id, { type: "start", runId: run.id });
     return this.view(conversation, run);
   }
 
@@ -330,6 +502,11 @@ export class ConversationRunner {
     };
     if (run.status === "failed") log.warn("run ended", fields);
     else log.info("run ended", fields);
+    // The run's outcome went through the conversation's write queue after its events, so the
+    // database now has all of them.
+    this.live.delete(conversation.id);
+    this.inputs.delete(conversation.id);
+    this.emit(conversation.id, { type: "end", runId: run.id });
   }
 
   private async prepare(conversation: Conversation, workdir: string) {
@@ -386,6 +563,7 @@ export class ConversationRunner {
       detached: true,
     });
     this.children.set(conversation.id, child);
+    const input = this.inputs.get(conversation.id);
     log.info("claude started", {
       conversation: conversation.id,
       run: run.id,
@@ -405,6 +583,8 @@ export class ConversationRunner {
         succeeded = event.is_error !== true;
         result = event;
       }
+      // Claude is still working (a later turn): give it the full quiet period again.
+      if (input?.idle) this.armIdle(input);
       // Only now does the session exist; until then a follow-up must not `--resume` it.
       // Stored right away so a crash later in the run cannot lose it.
       if (!conversation.sessionStarted && isInit(event)) {
@@ -413,7 +593,15 @@ export class ConversationRunner {
         sessionSaved.catch(() => undefined); // Awaited (and reported) once Claude exits.
       }
       seq += 1;
-      this.store.saveEvent(conversation.id, run.id, seq, new Date(), event);
+      const at = new Date();
+      const stored = { at: at.toISOString(), event };
+      this.live.get(conversation.id)?.events.push(stored);
+      this.store.saveEvent(conversation.id, run.id, seq, at, event);
+      this.emit(conversation.id, { type: "event", runId: run.id, seq, event: stored });
+      if (event.type === "result" && input) {
+        input.results += 1;
+        this.maybeCloseInput(input);
+      }
     };
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
@@ -427,8 +615,19 @@ export class ConversationRunner {
       stderr = (stderr + chunk.toString("utf8")).slice(-CLAUDE_STDERR_KEPT);
     });
     child.stdin.on("error", () => undefined);
-    child.stdin.end(`${JSON.stringify(userMessage(request))}\n`);
+    const prompt = `${JSON.stringify(userMessage(request))}\n`;
+    if (input?.open) {
+      // Stays open for messages sent while the run goes; closed once they are all answered.
+      const lines = [prompt, ...input.queued.splice(0)];
+      for (const line of lines) child.stdin.write(line);
+      input.stdin = child.stdin;
+      input.written = lines.length;
+    } else child.stdin.end(prompt);
     const code = await exitCode(child);
+    if (input) {
+      clearTimeout(input.idle);
+      input.open = false;
+    }
     this.children.delete(conversation.id);
     if (stderr.trim()) run.stderr = stderr;
     const fields = {
