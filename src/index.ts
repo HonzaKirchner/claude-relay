@@ -1,17 +1,59 @@
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { Store } from "./db.ts";
 import { createHandler } from "./http.ts";
-import { AgentRunner } from "./runner.ts";
+import { log } from "./log.ts";
+import { ConversationRunner } from "./runner.ts";
 
-const runner = new AgentRunner({
+const connectionString = process.env.DB_CONNECTION_STRING;
+if (!connectionString) {
+  log.error("DB_CONNECTION_STRING is not set; conversations are stored only in PostgreSQL, so the service cannot start");
+  process.exit(1);
+}
+
+const options = {
+  // Only the git checkouts Claude works in; all conversation data is in the database.
   dataDir: process.env.RUNNER_DATA_DIR || path.join(os.homedir(), ".claude-code-runner"),
   claudeCommand: process.env.CLAUDE_COMMAND || "claude",
   ghCommand: process.env.GH_COMMAND || "gh",
+  // Base URL of this service in a browser, e.g. https://coder.example.com/@me/ws/apps/claude-code-runner.
+  // When set, every ConversationView carries `url`, a link to the conversation page.
+  publicUrl: process.env.APP_URL || undefined,
+};
+log.info("starting", {
+  dataDir: options.dataDir,
+  claude: options.claudeCommand,
+  gh: options.ghCommand,
+  appUrl: options.publicUrl ?? "unset (responses carry no url)",
+  logLevel: process.env.LOG_LEVEL || "info",
 });
+
+const store = new Store(connectionString);
+try {
+  await store.migrate();
+} catch (error) {
+  log.error("database unavailable, cannot start", {
+    error: error instanceof Error ? error.message : String(error),
+  });
+  await store.close().catch(() => undefined);
+  process.exit(1);
+}
+log.info("database ready");
+
+const runner = new ConversationRunner({ ...options, store });
 await runner.load();
 
 const port = Number(process.env.PORT || 4115);
-createServer(createHandler(runner)).listen(port, "127.0.0.1", () => {
-  console.log(`claude-code-runner listening on 127.0.0.1:${port}`);
+const server = createServer(createHandler(runner)).listen(port, "127.0.0.1", () => {
+  log.info(`claude-code-runner listening on 127.0.0.1:${port}`);
 });
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => {
+    log.info("shutting down", { signal });
+    server.close();
+    // Pending event writes would otherwise be lost.
+    void store.close().finally(() => process.exit(0));
+  });
+}

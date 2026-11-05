@@ -2,8 +2,8 @@
 
 name: claude-relay
 
-# node version: .nvmrc. No runtime dependencies; this installs the dev tooling
-# (typescript, vitest) for the check and test tasks.
+# node version: .nvmrc. Installs `pg` (the service stores everything in PostgreSQL)
+# and the dev tooling (typescript, vitest) for the check and test tasks.
 setup:
   - nvm install
   - npm ci
@@ -25,7 +25,8 @@ tasks:
     command: 'npm test -- {{args}}'
     description: >-
       The vitest suite (fake claude and gh, local git origin), a few seconds.
-      Pass a name filter with -t to run one case. Needs no services.
+      Pass a name filter with -t to run one case. Needs PostgreSQL: starts a
+      throwaway Docker container, or set TEST_DATABASE_URL.
     timeout_seconds: 300
 
   check:
