@@ -31,6 +31,8 @@ export interface Run {
   stderr?: string;
   startedAt: string;
   finishedAt?: string;
+  /** The text of Claude's last successful `result`: its answer, shown to Rakazo as the summary. */
+  summary?: string;
   /** Messages sent while it was going, oldest first. */
   messages?: RunMessage[];
 }
@@ -114,10 +116,13 @@ export class Store {
       image_count: number | null;
       error: string | null;
       stderr: string | null;
+      result_text: string | null;
+      is_error: boolean | null;
       started_at: Date;
       finished_at: Date | null;
     }>(
-      `SELECT id, conversation_id, status, prompt, image_count, error, stderr, started_at, finished_at
+      `SELECT id, conversation_id, status, prompt, image_count, error, stderr, result_text, is_error,
+         started_at, finished_at
        FROM runs ORDER BY conversation_id, seq`,
     );
     const messages = await this.pool.query<{
@@ -162,6 +167,7 @@ export class Store {
         ...(row.image_count ? { imageCount: row.image_count } : {}),
         ...(row.error ? { error: row.error } : {}),
         ...(row.stderr ? { stderr: row.stderr } : {}),
+        ...(row.result_text && row.is_error !== true ? { summary: row.result_text } : {}),
         startedAt: row.started_at.toISOString(),
         ...(row.finished_at ? { finishedAt: row.finished_at.toISOString() } : {}),
         ...(messagesByRun.has(row.id) ? { messages: messagesByRun.get(row.id)! } : {}),

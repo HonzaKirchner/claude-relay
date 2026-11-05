@@ -102,10 +102,12 @@ interface ConversationView {
   id: string;
   title: string;            // first line of the launch prompt, ≤ 80 chars
   status: "running" | "finished" | "failed" | "cancelled";
-  runId: string;            // must match ^[A-Za-z0-9_-]+$ (Rakazo validates it)
+  runId: string;            // the run described; must match ^[A-Za-z0-9_-]+$ (Rakazo validates it)
+  latestRunId: string;      // the conversation's latest run, even when another run was asked for
   branch?: string;          // only once pushed
   prUrl?: string;
   error?: string;
+  summary?: string;         // the run's final answer: text of its last successful `result`, ≤ 4000 chars
   url?: string;             // conversation page `${APP_URL}/ui/conversations/:id`; only when APP_URL is set
 }
 ```

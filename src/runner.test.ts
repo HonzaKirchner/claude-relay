@@ -90,6 +90,7 @@ function start(text) {
   fs.writeFileSync("change-" + Date.now() + ".txt", text);
   console.log(JSON.stringify({
     type: "result", subtype: "success", is_error: false, total_cost_usd: 0.25,
+    result: "Done: " + text.split("\\n")[0],
     modelUsage: { "claude-opus-5-5": { inputTokens: 1200, outputTokens: 300, costUSD: 0.25 } },
   }));
 }
@@ -311,15 +312,29 @@ describe("claude code runner", () => {
       status: "finished",
       branch: "agent/agent-1",
       prUrl: `${REPOSITORY}/pull/7`,
+      latestRunId: first.body.runId,
+      summary: "Done: Add a file",
     });
     expect(git(origin, "log", "--format=%s", "agent/agent-1")).toContain("Add a file");
 
     const followup = await call("POST", "/agents/agent-1/runs", { prompt: "And another" });
     expect(followup.body.runId).not.toBe(first.body.runId);
     await runner.idle();
-    expect((await call("GET", `/agents/agent-1/runs/${first.body.runId}`)).body.status).toBe(
-      "finished",
-    );
+    // An older run keeps its own summary but points at the latest run.
+    expect((await call("GET", `/agents/agent-1/runs/${first.body.runId}`)).body).toMatchObject({
+      status: "finished",
+      runId: first.body.runId,
+      latestRunId: followup.body.runId,
+      summary: "Done: Add a file",
+    });
+    expect((await call("GET", "/agents/agent-1")).body).toMatchObject({
+      runId: followup.body.runId,
+      latestRunId: followup.body.runId,
+      summary: "Done: And another",
+    });
+    // The summary comes back from the database after a restart.
+    await restart();
+    expect((await call("GET", "/agents/agent-1")).body.summary).toBe("Done: And another");
     expect(git(origin, "log", "--format=%s", "agent/agent-1")).toContain("Add a file");
     expect(git(origin, "ls-tree", "--name-only", "agent/agent-1").split("\n")).toHaveLength(4);
 
@@ -345,6 +360,7 @@ describe("claude code runner", () => {
     await runner.idle();
     const result = await call("GET", "/conversations/broken");
     expect(result.body.status).toBe("failed");
+    expect(result.body.summary).toBeUndefined();
     expect(result.body.branch).toBeUndefined();
     expect(result.body.prUrl).toBeUndefined();
   });

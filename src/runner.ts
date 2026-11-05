@@ -29,10 +29,15 @@ export interface ConversationView {
   id: string;
   title: string;
   status: RunStatus;
+  /** The run this view describes: the latest one, or the one asked for by id. */
   runId: string;
+  /** The conversation's latest run, whichever run this view describes. */
+  latestRunId: string;
   branch?: string;
   prUrl?: string;
   error?: string;
+  /** What Claude answered at the end of the run (its `result` text), cut to `SUMMARY_MAX` chars. */
+  summary?: string;
   /** Where a person can follow the run in a browser. Only when the public URL is known. */
   url?: string;
 }
@@ -133,6 +138,8 @@ const STDERR_TAIL = 1_000;
 const CLAUDE_STDERR_KEPT = 64_000;
 /** Longest Claude Code failure text copied into a run's `error`. */
 const MAX_ERROR = 500;
+/** Longest `summary` in a view; the full text stays in the database (`runs.result_text`). */
+const SUMMARY_MAX = 4_000;
 
 /**
  * Runs one headless Claude Code session per conversation, each in its own checkout, and
@@ -582,6 +589,7 @@ export class ConversationRunner {
       if (event.type === "result") {
         succeeded = event.is_error !== true;
         result = event;
+        if (succeeded && typeof event.result === "string" && event.result.trim()) run.summary = event.result;
       }
       // Claude is still working (a later turn): give it the full quiet period again.
       if (input?.idle) this.armIdle(input);
@@ -754,10 +762,16 @@ function view(conversation: Conversation, run: Run): ConversationView {
     title: conversation.title,
     status: run.status,
     runId: run.id,
+    latestRunId: conversation.runs.at(-1)!.id,
     ...(conversation.pushed && conversation.branch ? { branch: conversation.branch } : {}),
     ...(conversation.prUrl ? { prUrl: conversation.prUrl } : {}),
     ...(run.error ? { error: run.error } : {}),
+    ...(run.summary ? { summary: cut(run.summary.trim(), SUMMARY_MAX) } : {}),
   };
+}
+
+function cut(text: string, max: number) {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
 function titleOf(prompt: string) {
