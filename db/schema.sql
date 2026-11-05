@@ -34,8 +34,9 @@ CREATE TABLE IF NOT EXISTS conversations (
   id          text PRIMARY KEY,                -- Rakazo's agent id
   title       text NOT NULL,
   session_id  uuid NOT NULL UNIQUE,            -- Claude Code session id
-  repository  text,
-  branch      text,                            -- agent/<id>; see `pushed`
+  repository  text,                            -- the checkout's origin, as a browser link
+  branch      text,                            -- agent/<id>, in the shared checkout; see `pushed`
+  base_branch text,                            -- what `branch` started from, when the launch named it
   open_pr     boolean NOT NULL DEFAULT false,
   session_started boolean NOT NULL DEFAULT false, -- Claude created the session; next run resumes it
   base_commit text,                            -- commit the branch started from
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pushed boolean NOT NULL DEFAULT false;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS session_started boolean NOT NULL DEFAULT false;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS base_commit text;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS base_branch text;
 
 CREATE TABLE IF NOT EXISTS runs (
   id               text PRIMARY KEY,           -- relay run id

@@ -43,9 +43,13 @@ export interface Conversation {
   sessionId: string;
   /** Whether Claude has created the session yet, so the next run must `--resume` it. */
   sessionStarted: boolean;
+  /** The checkout's origin, as a browser link. */
   repository?: string;
   openPr: boolean;
+  /** `agent/<id>`: the conversation's branch in the shared checkout. */
   branch?: string;
+  /** What `branch` was started from when the launch named it; else the origin's default branch. */
+  baseBranch?: string;
   baseCommit?: string;
   pushed: boolean;
   prUrl?: string;
@@ -100,12 +104,13 @@ export class Store {
       repository: string | null;
       open_pr: boolean;
       branch: string | null;
+      base_branch: string | null;
       base_commit: string | null;
       pushed: boolean;
       pr_url: string | null;
     }>(
-      `SELECT id, title, session_id, session_started, repository, open_pr, branch, base_commit,
-         pushed, pr_url
+      `SELECT id, title, session_id, session_started, repository, open_pr, branch, base_branch,
+         base_commit, pushed, pr_url
        FROM conversations ORDER BY created_at, id`,
     );
     const runs = await this.pool.query<{
@@ -153,6 +158,7 @@ export class Store {
         ...(row.repository ? { repository: row.repository } : {}),
         openPr: row.open_pr,
         ...(row.branch ? { branch: row.branch } : {}),
+        ...(row.base_branch ? { baseBranch: row.base_branch } : {}),
         ...(row.base_commit ? { baseCommit: row.base_commit } : {}),
         pushed: row.pushed,
         ...(row.pr_url ? { prUrl: row.pr_url } : {}),
@@ -189,12 +195,13 @@ export class Store {
       conversation.baseCommit ?? null,
       conversation.pushed,
       conversation.prUrl ?? null,
+      conversation.baseBranch ?? null,
     ];
     return this.enqueue(conversation.id, async () => {
       await this.pool.query(
         `INSERT INTO conversations (id, title, session_id, session_started, repository, open_pr,
-           branch, base_commit, pushed, pr_url)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           branch, base_commit, pushed, pr_url, base_branch)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          ON CONFLICT (id) DO UPDATE SET
            session_started = EXCLUDED.session_started, base_commit = EXCLUDED.base_commit,
            pushed = EXCLUDED.pushed, pr_url = EXCLUDED.pr_url, updated_at = now()`,

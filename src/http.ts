@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ConversationView, ConversationRunner, Image, LaunchRequest, PromptRequest, RunMessage } from "./runner.ts";
 import { log, since } from "./log.ts";
-import { ConversationBusy, RunNotRunning } from "./runner.ts";
+import { CheckoutDirty, ConversationBusy, RunNotRunning } from "./runner.ts";
 import type { LiveOp } from "./ui.ts";
 import { LiveRunRenderer, conversationsPage, sidePanels, transcriptPage } from "./ui.ts";
 
@@ -42,7 +42,13 @@ export function createHandler(runner: ConversationRunner) {
     }
     route(runner, request)
       .catch((error: unknown): Reply => {
-        if (error instanceof ConversationBusy) return { status: 409, body: { code: "busy" } };
+        // One checkout, one run at a time. `busy` is the code Rakazo knows; `reason` and the rest are
+        // additive: `locked` names the conversation whose run is going, `dirty` the branch the
+        // checkout is on with uncommitted changes to deal with by hand.
+        if (error instanceof ConversationBusy)
+          return { status: 409, body: { code: "busy", reason: "locked", conversation: error.conversation } };
+        if (error instanceof CheckoutDirty)
+          return { status: 409, body: { code: "busy", reason: "dirty", branch: error.branch } };
         if (error instanceof RunNotRunning) return { status: 409, body: { code: "not_running" } };
         if (error instanceof InvalidRequest) return { status: 400, body: { code: "invalid" } };
         log.error("request failed", {
@@ -239,7 +245,7 @@ function promptRequest(value: unknown): PromptRequest {
 
 function launchRequest(value: unknown): LaunchRequest {
   const request: LaunchRequest = promptRequest(value);
-  const { repository, openPr } = value as Record<string, unknown>;
+  const { repository, openPr, baseBranch } = value as Record<string, unknown>;
   if (repository !== undefined) {
     if (typeof repository !== "string" || !URL.canParse(repository)) throw new InvalidRequest();
     if (new URL(repository).protocol !== "https:") throw new InvalidRequest();
@@ -249,8 +255,15 @@ function launchRequest(value: unknown): LaunchRequest {
     if (typeof openPr !== "boolean") throw new InvalidRequest();
     request.openPr = openPr;
   }
+  if (baseBranch !== undefined) {
+    if (typeof baseBranch !== "string" || !BRANCH_NAME.test(baseBranch)) throw new InvalidRequest();
+    request.baseBranch = baseBranch;
+  }
   return request;
 }
+
+/** A plain branch name: what `git check-ref-format --branch` allows, without the odd corners, and never an option. */
+const BRANCH_NAME = /^(?!-)(?!.*(?:\.\.|@\{|\/\/|\/$|\.$|\.lock$))[^\s~^:?*[\\\x00-\x1f\x7f]{1,255}$/;
 
 function image(value: unknown): Image {
   if (isObject(value) && typeof value.url === "string" && URL.canParse(value.url))

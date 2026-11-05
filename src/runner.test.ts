@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Server } from "node:http";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -87,6 +87,12 @@ function start(text) {
     console.log(JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true }));
     process.exit(1);
   }
+  // Leaves a change behind and fails, like a run cut off half way.
+  if (text.includes("dirty")) {
+    fs.writeFileSync("leftover.txt", "work in progress");
+    console.log(JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true }));
+    process.exit(1);
+  }
   fs.writeFileSync("change-" + Date.now() + ".txt", text);
   console.log(JSON.stringify({
     type: "result", subtype: "success", is_error: false, total_cost_usd: 0.25,
@@ -107,6 +113,8 @@ let runner: ConversationRunner;
 let store: Store;
 let base: string;
 let origin: string;
+/** The one checkout every conversation works in, cloned from `origin`. */
+let checkout: string;
 
 function script(name: string, source: string) {
   const js = path.join(dir, `${name}.cjs`);
@@ -132,13 +140,13 @@ const identity = {
   GIT_COMMITTER_EMAIL: "test@example.com",
 };
 
-async function start(publicUrl?: string) {
+async function start(options: { publicUrl?: string; baseBranch?: string } = {}) {
   store = new Store(inject("databaseUrl"));
   await store.migrate();
   runner = new ConversationRunner({
     store,
-    ...(publicUrl ? { publicUrl } : {}),
-    dataDir: path.join(dir, "data"),
+    ...options,
+    workdir: checkout,
     claudeCommand: script("claude", FAKE_CLAUDE),
     ghCommand: script("gh", FAKE_GH),
     steerIdleMs: 300,
@@ -147,7 +155,7 @@ async function start(publicUrl?: string) {
       ...identity,
       FAKE_CLAUDE_LOG: path.join(dir, "claude.log"),
       FAKE_CLAUDE_GATE: path.join(dir, "gate"),
-      // Clone the example repository from a local origin instead of the network.
+      // The checkout's origin is the example repository's URL; git reaches the local origin instead.
       GIT_CONFIG_COUNT: "1",
       GIT_CONFIG_KEY_0: `url.${origin}.insteadOf`,
       GIT_CONFIG_VALUE_0: REPOSITORY,
@@ -160,9 +168,14 @@ async function start(publicUrl?: string) {
 }
 
 /** Like a service restart: everything the new runner knows comes from the database. */
-async function restart(publicUrl?: string) {
+async function restart(options: { publicUrl?: string; baseBranch?: string } = {}) {
   await stop();
-  await start(publicUrl);
+  await start(options);
+}
+
+/** The files on a branch of the origin. */
+function filesOn(branch: string) {
+  return git(origin, "ls-tree", "--name-only", branch).trim().split("\n").sort();
 }
 
 async function stop() {
@@ -248,6 +261,16 @@ beforeEach(async () => {
   git(seed, "add", ".");
   git(seed, "commit", "-m", "init");
   git(seed, "push", origin, "main");
+  // A second branch, for conversations that name their base.
+  git(seed, "checkout", "-b", "release");
+  writeFileSync(path.join(seed, "RELEASE.md"), "release\n");
+  git(seed, "add", ".");
+  git(seed, "commit", "-m", "release");
+  git(seed, "push", origin, "release");
+  // The checkout the service works in, as the Coder template has it: cloned from the repository.
+  checkout = path.join(dir, "checkout");
+  git(dir, "clone", "--quiet", origin, checkout);
+  git(checkout, "remote", "set-url", "origin", REPOSITORY);
   // Applies the schema, then every test starts from empty tables.
   const setup = new Store(inject("databaseUrl"));
   await setup.migrate();
@@ -264,10 +287,10 @@ afterEach(async () => {
 describe("claude code runner", () => {
   it("links each run to its conversation page when APP_URL is set", async () => {
     expect((await call("PUT", "/conversations/plain", { prompt: "hi" })).body.url).toBeUndefined();
-    await restart("https://coder.example.com/@me/ws/apps/claude-code-runner/");
+    await restart({ publicUrl: "https://coder.example.com/@me/ws/apps/claude/" });
     const launched = await call("PUT", "/conversations/linked", { prompt: "Say <hi>" });
     expect(launched.body.url).toBe(
-      `https://coder.example.com/@me/ws/apps/claude-code-runner/ui/conversations/linked`,
+      `https://coder.example.com/@me/ws/apps/claude/ui/conversations/linked`,
     );
     await runner.idle();
     const page = await fetch(`${base}/ui/conversations/linked`);
@@ -340,23 +363,117 @@ describe("claude code runner", () => {
     await restart();
     expect((await call("GET", "/agents/agent-1")).body.summary).toBe("Done: And another");
     expect(git(origin, "log", "--format=%s", "agent/agent-1")).toContain("Add a file");
-    expect(git(origin, "ls-tree", "--name-only", "agent/agent-1").split("\n")).toHaveLength(4);
+    expect(filesOn("agent/agent-1")).toHaveLength(3);
+    // The work happened in the one checkout, which is left on the conversation's branch.
+    expect(git(checkout, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/agent-1");
+    expect(git(checkout, "status", "--porcelain")).toBe("");
 
     const calls = readFileSync(path.join(dir, "claude.log"), "utf8").trim().split("\n");
     const [launchArgs, replyArgs] = calls.map((line) => JSON.parse(line) as string[]);
     const session = launchArgs![launchArgs!.indexOf("--session-id") + 1];
     expect(replyArgs![replyArgs!.indexOf("--resume") + 1]).toBe(session);
+    expect(launchArgs![launchArgs!.indexOf("--append-system-prompt") + 1]).toContain("branch agent/agent-1");
   });
 
-  it("refuses a reply while a run is going and cancels it", async () => {
+  it("runs one conversation at a time and cancels a run", async () => {
     const launched = await call("PUT", "/conversations/busy", { prompt: "hang" });
-    expect((await call("POST", "/conversations/busy/runs", { prompt: "More" })).status).toBe(409);
+    // One checkout: while a run is going, nothing else starts, in this conversation or another.
+    expect(await call("POST", "/conversations/busy/runs", { prompt: "More" })).toEqual({
+      status: 409,
+      body: { code: "busy", reason: "locked", conversation: "busy" },
+    });
+    expect(await call("PUT", "/conversations/other", { prompt: "hi" })).toEqual({
+      status: 409,
+      body: { code: "busy", reason: "locked", conversation: "busy" },
+    });
+    expect((await call("GET", "/conversations/other")).status).toBe(404);
     const cancelled = await call("POST", `/conversations/busy/runs/${launched.body.runId}/cancel`);
     expect(cancelled.body.status).toBe("cancelled");
     expect(
       (await call("POST", `/conversations/busy/runs/${launched.body.runId}/cancel`)).body.status,
     ).toBe("cancelled");
+    // Once it has stopped, the checkout is free for anyone.
+    expect((await call("PUT", "/conversations/other", { prompt: "hi" })).status).toBe(200);
+    await runner.idle();
+    expect((await call("GET", "/conversations/other")).body.status).toBe("finished");
     expect((await call("POST", "/conversations/busy/runs", { prompt: "Again" })).status).toBe(200);
+    await runner.idle();
+    expect((await call("GET", "/conversations/busy")).body.status).toBe("finished");
+  });
+
+  it("refuses runs while the checkout has leftovers, unless they are the conversation's own", async () => {
+    await call("PUT", "/conversations/messy", { prompt: "dirty" });
+    await runner.idle();
+    expect((await call("GET", "/conversations/messy")).body).toMatchObject({ status: "failed" });
+    expect(git(checkout, "status", "--porcelain")).toContain("leftover.txt");
+
+    // Another conversation would start on those changes: refused, and not created.
+    expect(await call("PUT", "/conversations/next", { prompt: "hi" })).toEqual({
+      status: 409,
+      body: { code: "busy", reason: "dirty", branch: "agent/messy" },
+    });
+    expect((await call("GET", "/conversations/next")).status).toBe(404);
+
+    // The conversation they belong to goes on from them and publishes them with its work.
+    await call("POST", "/conversations/messy/runs", { prompt: "Clean up" });
+    await runner.idle();
+    expect((await call("GET", "/conversations/messy")).body).toMatchObject({ status: "finished", branch: "agent/messy" });
+    expect(filesOn("agent/messy")).toEqual(["README.md", expect.stringMatching(/^change-/), "leftover.txt"]);
+
+    // Now the next conversation starts, from the origin's main and not from the previous branch.
+    expect((await call("PUT", "/conversations/next", { prompt: "hi" })).status).toBe(200);
+    await runner.idle();
+    expect(filesOn("agent/next")).toEqual(["README.md", expect.stringMatching(/^change-/)]);
+    expect(git(checkout, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/next");
+
+    // A person's own changes in the checkout are refused as well, whatever branch they are on.
+    git(checkout, "checkout", "--quiet", "main");
+    writeFileSync(path.join(checkout, "README.md"), "edited by hand\n");
+    expect(await call("POST", "/conversations/next/runs", { prompt: "more" })).toEqual({
+      status: 409,
+      body: { code: "busy", reason: "dirty", branch: "main" },
+    });
+  });
+
+  it("starts a conversation from the named base branch", async () => {
+    expect((await call("PUT", "/conversations/bad", { prompt: "x", baseBranch: "-x" })).status).toBe(400);
+    expect((await call("PUT", "/conversations/bad", { prompt: "x", baseBranch: "a b" })).status).toBe(400);
+    await call("PUT", "/conversations/rel", { prompt: "On release", baseBranch: "release" });
+    await runner.idle();
+    expect(filesOn("agent/rel")).toEqual(["README.md", "RELEASE.md", expect.stringMatching(/^change-/)]);
+    expect(await sql("SELECT base_branch FROM conversations WHERE id = 'rel'")).toEqual([{ base_branch: "release" }]);
+
+    // The service can have a base branch of its own; the launch's still wins.
+    await restart({ baseBranch: "release" });
+    await call("PUT", "/conversations/rel-2", { prompt: "Also on release" });
+    await runner.idle();
+    expect(filesOn("agent/rel-2")).toContain("RELEASE.md");
+    await call("PUT", "/conversations/main-2", { prompt: "On main", baseBranch: "main" });
+    await runner.idle();
+    expect(filesOn("agent/main-2")).not.toContain("RELEASE.md");
+  });
+
+  it("restores a conversation's branch from the origin when the checkout lost it", async () => {
+    await call("PUT", "/conversations/old", { prompt: "First" });
+    await runner.idle();
+    // As after moving to a new checkout: the branch is only on the origin.
+    git(checkout, "checkout", "--quiet", "main");
+    git(checkout, "branch", "-D", "agent/old");
+    await call("POST", "/conversations/old/runs", { prompt: "Second" });
+    await runner.idle();
+    expect((await call("GET", "/conversations/old")).body.status).toBe("finished");
+    expect(filesOn("agent/old")).toHaveLength(3);
+    expect(git(origin, "log", "--format=%s", "agent/old").trim().split("\n")).toEqual(["First", "First", "init"]);
+
+    // A branch that was never pushed cannot come back: the conversation starts again from the base.
+    await call("PUT", "/conversations/lost", { prompt: "fail" });
+    await runner.idle();
+    git(checkout, "checkout", "--quiet", "main");
+    git(checkout, "branch", "-D", "agent/lost");
+    await call("POST", "/conversations/lost/runs", { prompt: "Retry" });
+    await runner.idle();
+    expect((await call("GET", "/conversations/lost")).body).toMatchObject({ status: "finished", branch: "agent/lost" });
+    expect(filesOn("agent/lost")).toHaveLength(2);
   });
 
   it("reports failures and does not publish them", async () => {
@@ -364,9 +481,24 @@ describe("claude code runner", () => {
     await runner.idle();
     const result = await call("GET", "/conversations/broken");
     expect(result.body.status).toBe("failed");
-    expect(result.body.summary).toBeUndefined();
+    // Rakazo shows only `summary`, so a failed run says there why it failed.
+    expect(result.body.error).toBe("Claude Code failed: error_during_execution");
+    expect(result.body.summary).toBe(result.body.error);
     expect(result.body.branch).toBeUndefined();
     expect(result.body.prUrl).toBeUndefined();
+  });
+
+  it("cuts the summary to what Rakazo keeps of a reply", async () => {
+    const line = "x".repeat(25_000);
+    await call("PUT", "/conversations/long", { prompt: `${line}\nmore` });
+    await runner.idle();
+    const { title, summary } = (await call("GET", "/conversations/long")).body;
+    expect(title).toHaveLength(80);
+    expect(summary).toHaveLength(20_000);
+    expect(summary!.startsWith("Done: xxx")).toBe(true);
+    expect(summary!.endsWith("…")).toBe(true);
+    // The whole answer is in the database.
+    expect(await sql("SELECT length(result_text) AS n FROM runs WHERE conversation_id = 'long'")).toEqual([{ n: 25_006 }]);
   });
 
   it("reports why Claude Code failed and starts the session again after it refused", async () => {
@@ -415,7 +547,7 @@ describe("claude code runner", () => {
     const otherStore = new Store(inject("databaseUrl"));
     const restarted = new ConversationRunner({
       store: otherStore,
-      dataDir: path.join(dir, "data"),
+      workdir: checkout,
       claudeCommand: "claude",
       ghCommand: "gh",
     });
@@ -436,11 +568,9 @@ describe("claude code runner", () => {
     await call("POST", "/conversations/kept/runs", { prompt: "refuse" });
     await runner.idle();
 
-    // On disk there is only the checkout Claude works in.
-    expect(readdirSync(path.join(dir, "data"))).toEqual(["work"]);
-
-    expect(await sql("SELECT id, title, session_started, pushed, pr_url, base_commit IS NOT NULL AS has_base FROM conversations")).toEqual([
-      { id: "kept", title: "Add a file", session_started: true, pushed: true, pr_url: `${REPOSITORY}/pull/7`, has_base: true },
+    // The launch's `repository` is ignored: the conversation's is the checkout's origin.
+    expect(await sql("SELECT id, title, repository, branch, session_started, pushed, pr_url, base_commit IS NOT NULL AS has_base FROM conversations")).toEqual([
+      { id: "kept", title: "Add a file", repository: REPOSITORY, branch: "agent/kept", session_started: true, pushed: true, pr_url: `${REPOSITORY}/pull/7`, has_base: true },
     ]);
     const runs = await sql("SELECT seq, status, prompt, error, stderr FROM runs ORDER BY seq");
     expect(runs).toMatchObject([

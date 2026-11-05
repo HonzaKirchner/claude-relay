@@ -13,16 +13,18 @@ if (!connectionString) {
 }
 
 const options = {
-  // Only the git checkouts Claude works in; all conversation data is in the database.
-  dataDir: process.env.RUNNER_DATA_DIR || path.join(os.homedir(), ".claude-code-runner"),
+  // The one git checkout Claude works in; all conversation data is in the database.
+  workdir: path.resolve(process.env.RUNNER_WORKDIR || path.join(os.homedir(), "src")),
+  baseBranch: process.env.RUNNER_BASE_BRANCH || undefined,
   claudeCommand: process.env.CLAUDE_COMMAND || "claude",
   ghCommand: process.env.GH_COMMAND || "gh",
-  // Base URL of this service in a browser, e.g. https://coder.example.com/@me/ws/apps/claude-code-runner.
+  // Base URL of this service in a browser, e.g. https://coder.example.com/@me/ws/apps/claude.
   // When set, every ConversationView carries `url`, a link to the conversation page.
   publicUrl: process.env.APP_URL || undefined,
 };
 log.info("starting", {
-  dataDir: options.dataDir,
+  workdir: options.workdir,
+  baseBranch: options.baseBranch ?? "the origin's default branch",
   claude: options.claudeCommand,
   gh: options.ghCommand,
   appUrl: options.publicUrl ?? "unset (responses carry no url)",
@@ -42,7 +44,13 @@ try {
 log.info("database ready");
 
 const runner = new ConversationRunner({ ...options, store });
-await runner.load();
+try {
+  await runner.load();
+} catch (error) {
+  log.error("cannot start", { error: error instanceof Error ? error.message : String(error) });
+  await store.close().catch(() => undefined);
+  process.exit(1);
+}
 
 const port = Number(process.env.PORT || 4115);
 const server = createServer(createHandler(runner)).listen(port, "127.0.0.1", () => {
