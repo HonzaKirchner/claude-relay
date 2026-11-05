@@ -12,7 +12,8 @@ Its primary consumer is [Rakazo](https://rakazo.com)'s **Cloud Agent** integrati
 
 | Term | Meaning |
 | --- | --- |
-| **conversation** | One Claude Code session with its own checkout, branch and PR. Created by a launch, extended by follow-ups. Rakazo calls it an **agent**: the HTTP API also answers under `/agents/:id` for Rakazo, and the `agent/<id>` branch keeps that name. |
+| **conversation** | One Claude Code session with its own branch and PR in the workspace's one checkout. Created by a launch, extended by follow-ups. Rakazo calls it an **agent**: the HTTP API also answers under `/agents/:id` for Rakazo, and the `agent/<id>` branch keeps that name. |
+| **checkout** | The one git checkout (`RUNNER_WORKDIR`) every conversation works in, the codebase the workspace builds and serves. One run at a time, because there is one checkout. |
 | **run** | One prompt sent to the conversation: one `claude --print` process with its own `runId` and status. |
 | **event** | One stream-json line a run printed (`system`, `assistant`, `user`, `result`, ...). |
 | **tool call** | A `tool_use` block from an assistant event, paired with its `tool_result`. |
@@ -25,7 +26,7 @@ Use these names in code and the database; use "agent" only where Rakazo's contra
 | --- | --- |
 | `src/index.ts` | Entry point: reads env, loads state, listens on `127.0.0.1:$PORT`. |
 | `src/http.ts` | Routing, request validation, error → status mapping. |
-| `src/runner.ts` | `ConversationRunner`: per-conversation checkout, `claude` process, commit/push/PR, persistence. |
+| `src/runner.ts` | `ConversationRunner`: the shared checkout and its lock, per-conversation branches, `claude` process, commit/push/PR, persistence. |
 | `src/ui.ts` | HTML pages served at `/ui/conversations/:id` and `/ui/conversations` (the list), and `LiveRunRenderer`, which turns a running run's events into changes to the open page. |
 | `src/db.ts` | `Store`: the PostgreSQL store, the only place conversations, runs, events and tool calls are kept (`db/schema.sql`). Required: the service exits without `DB_CONNECTION_STRING` or a reachable database. |
 | `src/log.ts` | One-line `key=value` logger, filtered by `LOG_LEVEL`. |
@@ -59,7 +60,8 @@ In an apix dev sandbox, [`apix.yaml`](apix.yaml) defines the `relay` service and
 - Only erasable TypeScript (`erasableSyntaxOnly`): no enums, namespaces or parameter properties. Import local files with the `.ts` extension.
 - Child processes are spawned `detached` and stopped by process group, so cancel also kills anything `claude` started. Keep that when adding commands; route them through `AgentRunner.exec` so cancel can reach them.
 - Log through `src/log.ts` (`log.info(message, { conversation, run, ... })`), not `console`. Never log prompts or tokens. Keep the `claude-code-runner listening on` startup line: apix's `ready_when` matches it.
-- **The database is the only store.** Conversations, runs, events and Claude's stderr go to PostgreSQL through `Store`, never to files; the data directory holds only git checkouts. Store a launch or follow-up before starting it, and fail the request if that write fails. Schema changes must be additive and idempotent in `db/schema.sql` (existing databases are migrated in place on start).
+- **The database is the only store.** Conversations, runs, events and Claude's stderr go to PostgreSQL through `Store`, never to files; the checkout holds only the code. Store a launch or follow-up before starting it, and fail the request if that write fails. Schema changes must be additive and idempotent in `db/schema.sql` (existing databases are migrated in place on start).
+- **One checkout, one run at a time.** Every run works in `RUNNER_WORKDIR` on the conversation's branch, so the runner holds a single lock (`current`) across all conversations and refuses, never queues, a run while another is going or while the checkout is dirty. Take the lock before the first `await` of a launch or follow-up, and release it only once the run has ended. Never clone, and never touch the checkout outside a run.
 
 ## The Rakazo Cloud Agent contract
 
@@ -84,10 +86,10 @@ The canonical paths start with `/conversations`. Every one of them is also serve
 | Method & path | Body | Behaviour |
 | --- | --- | --- |
 | `GET /health` | – | `{ "ok": true }` |
-| `PUT /conversations/:id` | `LaunchRequest` | Creates the conversation and its first run. **Idempotent**: repeating it with the same id returns the existing conversation's latest run and starts nothing. |
+| `PUT /conversations/:id` | `LaunchRequest` | Creates the conversation and its first run. **Idempotent**: repeating it with the same id returns the existing conversation's latest run and starts nothing. `409 busy` while any conversation's run is going (`reason: "locked"`) or while the checkout has uncommitted changes (`reason: "dirty"`); neither creates the conversation. |
 | `GET /conversations/:id` | – | Latest run. |
 | `GET /conversations/:id/runs/:runId` | – | A specific run. |
-| `POST /conversations/:id/runs` | `PromptRequest` | Starts a follow-up that resumes the same Claude session. `409 busy` while a run is going. |
+| `POST /conversations/:id/runs` | `PromptRequest` | Starts a follow-up that resumes the same Claude session. `409 busy` while any conversation's run is going (`locked`), or while the checkout has uncommitted changes that are not this conversation's own (`dirty`). |
 | `GET /ui/conversations/:id` | – | HTML page with the conversation and a sidebar listing every conversation, for people. Rakazo never calls it. |
 | `GET /ui/conversations` | – | HTML page with just the conversation list. |
 | `GET /ui/conversations/:id/stream?run=&after=` | – | Server-sent events for the conversation page: `patch` with HTML changes as the running run prints events, `reload` when a run starts or ends. Fed from memory by `ConversationRunner.subscribe`, not the database. Rakazo never calls it. Together with the two pages above, the only non-JSON success responses. |
@@ -97,7 +99,11 @@ The canonical paths start with `/conversations`. Every one of them is also serve
 ```ts
 type Image = { data: string; mimeType: "image/png" | "image/jpeg" | "image/gif" | "image/webp" } | { url: string };
 interface PromptRequest { prompt: string /* non-blank, ≤ 100 000 chars */; images?: Image[] /* ≤ 5 */ }
-interface LaunchRequest extends PromptRequest { repository?: string /* https URL */; openPr?: boolean }
+interface LaunchRequest extends PromptRequest {
+  repository?: string;  // https URL; part of Rakazo's contract, validated and ignored: the work happens in the checkout
+  openPr?: boolean;
+  baseBranch?: string;  // what the conversation's branch starts from; default RUNNER_BASE_BRANCH, else the origin's default branch
+}
 ```
 
 Every success response is a `ConversationView` (the fork's adapter calls the same shape `AgentView`):
@@ -124,7 +130,7 @@ Errors are `{ "code": ... }`, and Rakazo maps them as follows:
 | --- | --- | --- |
 | 400 | `invalid` | Request rejected, not retried. |
 | 404 | `not_found` | Agent gone, not retried. |
-| 409 | `busy` | Follow-up refused; Rakazo observes the current run instead of resending. |
+| 409 | `busy` | Launch or follow-up refused. Rakazo observes the current run instead of resending. The body adds, additively, `reason`: `locked` (a run is going, and `conversation` names whose) or `dirty` (the checkout has uncommitted changes that are not the conversation's own, and `branch` names the branch it is on; someone has to commit, stash or discard them in the workspace). **Check**: Rakazo's adapter handled `busy` only for a follow-up of the running conversation; a launch, or a follow-up of an idle conversation, refused because *another* conversation runs or the checkout is dirty is new to it. |
 | 409 | `not_running` | Steering message refused (only `POST .../messages`, which Rakazo does not call). |
 | 500 | `internal` | Generic failure. |
 | 404 | `route_not_found` | Generic failure. |
@@ -135,13 +141,14 @@ Errors are `{ "code": ... }`, and Rakazo maps them as follows:
 - **Runs**: each launch or follow-up creates a new `runId`. Rakazo tracks follow-ups by `runId` and polls `GET /agents/:id/runs/:runId` (the alias), so old runs must stay readable.
 - **What Rakazo shows**: of a view it reads only `id`, `title`, `status`, `runId`, `branch`, `prUrl` and `summary` (`agentSchema` in the adapter); `error`, `latestRunId` and `url` are ignored. Its card and its `cloud_agent_status` tool show `summary` as the run's outcome, and it stores up to 20 000 characters of it. A new run must come with no summary (the previous reply must not linger), and a failed run carries its `error` as the summary so the failure is visible in Rakazo. Rakazo writes its own title from the prompt; ours is a fallback.
 - **Sessions**: runs use `--session-id <uuid>` until Claude has created the session (its `system/init` event), then `--resume <uuid>`, so context carries over. A run where Claude exits before creating it, e.g. refusing to start, leaves the next run to create it.
-- **Repository work**: with `repository`, the agent works in its own clone on branch `agent/<first 12 chars of id>`. When a run finishes successfully, leftover changes are committed with the title as message, the branch is pushed, and with `openPr` one PR is opened (or the existing one reused) via `gh`. Failed or cancelled runs publish nothing.
-- **Restarts**: a run that was `running` when the service stopped is reported as `failed` on the next start. Conversations live only in PostgreSQL (`DB_CONNECTION_STRING`); the checkouts in `RUNNER_DATA_DIR/work/` must survive restarts too.
+- **The checkout**: every conversation works in `RUNNER_WORKDIR`, the workspace's one checkout, on branch `agent/<first 12 chars of id>`. The launch's `repository` is ignored (the conversation records the checkout's origin instead). A new conversation's branch is fetched and created from `baseBranch`, else `RUNNER_BASE_BRANCH`, else the origin's default branch. Each run first puts the checkout on the conversation's branch (restoring it from the origin if the checkout lost it and it was pushed, else starting again from the base). When a run finishes successfully, leftover changes are committed with the title as message, the branch is pushed, and with `openPr` one PR is opened (or the existing one reused) via `gh`. Failed or cancelled runs publish nothing and leave their changes in the checkout: the same conversation goes on from them, every other request is refused with `busy` (`reason: "dirty"`) until someone deals with them.
+- **One run at a time**: there is one checkout, so a launch or follow-up while any conversation's run is going is refused with `busy` (`reason: "locked"`); nothing is queued. The checkout is left on the last conversation's branch, so what the workspace builds and serves is that conversation's work.
+- **Restarts**: a run that was `running` when the service stopped is reported as `failed` on the next start. Conversations live only in PostgreSQL (`DB_CONNECTION_STRING`); the checkout must survive restarts too, with the conversations' branches in it.
 - **Workspace lifecycle** (start on demand, retry later) is Rakazo's job, not this service's.
 - **Lost follow-up responses**: upstream's poller never resends a follow-up blindly. It calls `GET /agents/:id` and treats a new `runId` as proof the follow-up was accepted. So the latest run must be visible as soon as `POST /agents/:id/runs` returns.
 - **Steering**: `claude`'s stdin stays open after the prompt so messages can be written to it mid-run. It is closed once Claude has printed a `result` for every message written; if Claude merged a mid-turn message into the turn it was on, results stay behind, so stdin is also closed after `STEER_IDLE_MS` without output following a `result`. Closing stdin is what makes `claude --print` exit, so keep both rules.
 - **Cancel by run**: the poller cancels the run it is tracking. Cancelling an older, already-finished run must return that run unchanged and must not touch a newer one.
-- **`expired`**: the interface also has an `expired` status (agent gone or archived). This service never reports it. Agents and checkouts are kept forever.
+- **`expired`**: the interface also has an `expired` status (agent gone or archived). This service never reports it. Agents and their branches are kept forever.
 
 ### Changing the contract
 

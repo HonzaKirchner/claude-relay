@@ -2,7 +2,6 @@ import type { ChildProcess } from "node:child_process";
 import type { Writable } from "node:stream";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import type { ClaudeEvent, Conversation, Run, RunMessage, RunStatus, Store, StoredEvent } from "./db.ts";
 import { log, since } from "./log.ts";
@@ -17,8 +16,11 @@ export interface PromptRequest {
 }
 
 export interface LaunchRequest extends PromptRequest {
+  /** Part of Rakazo's contract, accepted and ignored: every conversation works in the one checkout. */
   repository?: string;
   openPr?: boolean;
+  /** The branch the conversation's branch starts from; the origin's default branch when unset. */
+  baseBranch?: string;
 }
 
 /**
@@ -68,8 +70,10 @@ export interface ConversationSummary {
 export interface RunnerOptions {
   /** Where conversations, runs and events are stored. The only persistent state. */
   store: Store;
-  /** Holds the git checkouts Claude works in (`work/<id>`); no conversation data. */
-  dataDir: string;
+  /** The one git checkout every conversation works in, on its own branch; no conversation data. */
+  workdir: string;
+  /** What new conversations branch from when the launch names no `baseBranch`; the origin's default branch when unset. */
+  baseBranch?: string;
   claudeCommand: string;
   ghCommand: string;
   env?: NodeJS.ProcessEnv;
@@ -98,7 +102,25 @@ export type LiveUpdate =
   | { type: "start"; runId: string }
   | { type: "end"; runId: string };
 
-export class ConversationBusy extends Error {}
+/** A run was asked for while another one is going: there is one checkout, so one run at a time. */
+export class ConversationBusy extends Error {
+  /** The conversation whose run is going. */
+  readonly conversation: string;
+  constructor(conversation: string) {
+    super("Another run is going.");
+    this.conversation = conversation;
+  }
+}
+
+/** The checkout has uncommitted changes that are not the conversation's own, so a run cannot start on it. */
+export class CheckoutDirty extends Error {
+  /** The branch the checkout is on. */
+  readonly branch: string;
+  constructor(branch: string) {
+    super("The checkout has uncommitted changes.");
+    this.branch = branch;
+  }
+}
 
 /** A message was sent to a run that is not going, or no longer takes messages (it is publishing). */
 export class RunNotRunning extends Error {}
@@ -145,8 +167,12 @@ const MAX_ERROR = 500;
 const SUMMARY_MAX = 20_000;
 
 /**
- * Runs one headless Claude Code session per conversation, each in its own checkout, and
- * publishes the result as a branch (and optionally a pull request).
+ * Runs one headless Claude Code session per conversation, all in the one checkout (`workdir`),
+ * each on its own branch, and publishes the result as that branch (and optionally a pull request).
+ *
+ * The checkout is shared, so one run goes at a time: a launch or follow-up while another
+ * conversation's run is going is refused (`ConversationBusy`), as is one while the checkout
+ * has leftover changes of another conversation or of a person (`CheckoutDirty`).
  *
  * Every conversation and run lives in the database. The in-memory map is a cache filled
  * from it at start; a change counts only once the database has it.
@@ -155,6 +181,10 @@ export class ConversationRunner {
   private readonly options: RunnerOptions;
   private readonly store: Store;
   private readonly conversations = new Map<string, Conversation>();
+  /** The conversation holding the checkout: the one whose run is going, or being started. */
+  private current?: string;
+  /** The checkout's origin URL, recorded on each conversation as its repository. */
+  private origin?: string;
   /** The child process a conversation is waiting on right now (git, claude or gh). */
   private readonly children = new Map<string, ChildProcess>();
   private readonly active = new Map<string, Promise<void>>();
@@ -168,8 +198,18 @@ export class ConversationRunner {
     this.store = options.store;
   }
 
-  /** Loads every conversation from the database. A run that was going when the runner stopped can never finish. */
+  /**
+   * Checks the checkout and loads every conversation from the database. A run that was going
+   * when the runner stopped can never finish.
+   */
   async load() {
+    // The URL as configured (`remote get-url` would apply insteadOf rewrites), for links.
+    this.origin = repositoryUrl(
+      await this.exec(undefined, "git", ["config", "--get", "remote.origin.url"], {
+        error: `${this.options.workdir} is not a git checkout with an origin.`,
+      }),
+    );
+    log.info("checkout ready", { workdir: this.options.workdir, repository: this.origin });
     for (const conversation of await this.store.loadConversations()) {
       this.conversations.set(conversation.id, conversation);
       const run = conversation.runs.at(-1);
@@ -200,15 +240,43 @@ export class ConversationRunner {
       title: titleOf(request.prompt),
       sessionId: randomUUID(),
       sessionStarted: false,
-      ...(request.repository
-        ? { repository: request.repository, branch: `agent/${id.slice(0, 12)}` }
-        : {}),
+      // The launch's `repository` is ignored: the work happens in the one checkout.
+      ...(this.origin ? { repository: this.origin } : {}),
+      branch: `agent/${id.slice(0, 12)}`,
+      ...(request.baseBranch ? { baseBranch: request.baseBranch } : {}),
       openPr: request.openPr ?? false,
       pushed: false,
       runs: [],
     };
+    await this.acquire(conversation);
     this.conversations.set(id, conversation);
     return this.start(conversation, request);
+  }
+
+  /**
+   * Takes the checkout for the conversation's next run. Refused while another run is going, and
+   * while the checkout has uncommitted changes, unless it is on the conversation's own branch:
+   * those are its own leftovers (a failed or cancelled run), which the run goes on from.
+   */
+  private async acquire(conversation: Conversation) {
+    if (this.current) {
+      log.info("run refused, another run is going", { conversation: conversation.id, running: this.current });
+      throw new ConversationBusy(this.current);
+    }
+    // Set before anything awaits, so a request arriving meanwhile is refused.
+    this.current = conversation.id;
+    try {
+      if ((await this.exec(undefined, "git", ["status", "--porcelain"])).trim()) {
+        const head = (await this.exec(undefined, "git", ["rev-parse", "--abbrev-ref", "HEAD"])).trim();
+        if (head !== conversation.branch) {
+          log.warn("run refused, the checkout has uncommitted changes", { conversation: conversation.id, branch: head });
+          throw new CheckoutDirty(head);
+        }
+      }
+    } catch (error) {
+      this.current = undefined;
+      throw error;
+    }
   }
 
   get(id: string, runId?: string): ConversationView | undefined {
@@ -255,10 +323,7 @@ export class ConversationRunner {
   async reply(id: string, request: PromptRequest): Promise<ConversationView | undefined> {
     const conversation = this.conversations.get(id);
     if (!conversation) return undefined;
-    if (conversation.runs.at(-1)?.status === "running") {
-      log.info("follow-up refused, a run is going", { conversation: id });
-      throw new ConversationBusy();
-    }
+    await this.acquire(conversation);
     return this.start(conversation, request);
   }
 
@@ -417,6 +482,7 @@ export class ConversationRunner {
       conversation.runs.pop();
       this.live.delete(conversation.id);
       this.inputs.delete(conversation.id);
+      this.current = undefined;
       if (seq === 1) this.conversations.delete(conversation.id);
       log.error("could not store the new run, nothing started", {
         conversation: conversation.id,
@@ -436,6 +502,7 @@ export class ConversationRunner {
     const work = this.execute(conversation, run, request).finally(() => {
       this.active.delete(conversation.id);
       this.cancelled.delete(run.id);
+      this.current = undefined;
     });
     this.active.set(conversation.id, work);
     this.emit(conversation.id, { type: "start", runId: run.id });
@@ -470,17 +537,16 @@ export class ConversationRunner {
   }
 
   private async execute(conversation: Conversation, run: Run, request: PromptRequest) {
-    const workdir = path.join(this.options.dataDir, "work", conversation.id);
     const started = performance.now();
     try {
-      await this.prepare(conversation, workdir);
-      const outcome = await this.claude(conversation, run, request, workdir);
+      await this.prepare(conversation);
+      const outcome = await this.claude(conversation, run, request);
       if (this.cancelled.has(run.id)) run.status = "cancelled";
       else if (!outcome.ok) {
         run.status = "failed";
         run.error = outcome.error;
       } else {
-        if (conversation.repository) await this.publish(conversation, workdir);
+        await this.publish(conversation);
         run.status = "finished";
       }
     } catch (error) {
@@ -519,41 +585,61 @@ export class ConversationRunner {
     this.emit(conversation.id, { type: "end", runId: run.id });
   }
 
-  private async prepare(conversation: Conversation, workdir: string) {
-    if (await exists(workdir)) return;
-    const partial = `${workdir}.partial`;
-    await rm(partial, { recursive: true, force: true });
-    await mkdir(path.dirname(workdir), { recursive: true });
-    if (conversation.repository) {
-      log.info("cloning repository", { conversation: conversation.id, repository: conversation.repository });
-      await this.exec(conversation, "git", ["clone", "--", conversation.repository, partial], undefined, {
-        error: "Could not clone the repository.",
-      });
-      await this.exec(conversation, "git", ["checkout", "-b", conversation.branch!], partial, {
-        error: "Could not create the conversation's branch.",
-      });
-      conversation.baseCommit = (
-        await this.exec(conversation, "git", ["rev-parse", "HEAD"], partial, {
-          error: "Could not read the repository.",
-        })
-      ).trim();
+  /**
+   * Puts the checkout on the conversation's branch. A new conversation's branch starts from the
+   * origin's base branch, freshly fetched. A conversation whose branch is not in the checkout
+   * (made before the checkout was shared) gets it back from the origin if it was pushed, and
+   * otherwise starts again from the base branch.
+   */
+  private async prepare(conversation: Conversation) {
+    const branch = conversation.branch!;
+    const git = (args: string[], error: string) => this.exec(conversation, "git", args, { error });
+    const head = (await git(["rev-parse", "--abbrev-ref", "HEAD"], "Could not read the checkout.")).trim();
+    if (head === branch && conversation.baseCommit) return;
+    if (conversation.baseCommit && (await this.hasRef(conversation, `refs/heads/${branch}`))) {
+      await git(["checkout", branch], "Could not switch to the conversation's branch.");
+      return;
+    }
+    await git(["fetch", "origin"], "Could not fetch the origin.");
+    if (conversation.pushed && (await this.hasRef(conversation, `refs/remotes/origin/${branch}`))) {
+      log.info("branch restored from the origin", { conversation: conversation.id, branch });
+      await git(["checkout", "-B", branch, "--track", `origin/${branch}`], "Could not restore the conversation's branch.");
+    } else {
+      const base = conversation.baseBranch ?? this.options.baseBranch ?? (await this.defaultBranch(conversation));
+      log.info("branch created", { conversation: conversation.id, branch, base });
+      await git(["checkout", "--no-track", "-B", branch, `origin/${base}`], `Could not create the conversation's branch from ${base}.`);
+      conversation.baseCommit = undefined;
+    }
+    if (!conversation.baseCommit) {
+      conversation.baseCommit = (await git(["rev-parse", "HEAD"], "Could not read the checkout.")).trim();
       // Publishing needs it on every later run, so the run cannot go on without it stored.
       await this.store.saveConversation(conversation);
-    } else {
-      await mkdir(partial);
     }
-    await rename(partial, workdir);
+  }
+
+  private async hasRef(conversation: Conversation, ref: string) {
+    return this.exec(conversation, "git", ["rev-parse", "--verify", "--quiet", ref], { quiet: true }).then(
+      () => true,
+      () => false,
+    );
+  }
+
+  /** The origin's default branch, e.g. `main`, from its HEAD. */
+  private async defaultBranch(conversation: Conversation) {
+    const output = await this.exec(conversation, "git", ["ls-remote", "--symref", "origin", "HEAD"], {
+      error: "Could not read the origin's default branch.",
+    });
+    const match = /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(output);
+    if (!match) throw new Error("Could not read the origin's default branch.");
+    return match[1]!;
   }
 
   private async claude(
     conversation: Conversation,
     run: Run,
     request: PromptRequest,
-    workdir: string,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
-    const note = conversation.branch
-      ? `You are working on the git branch ${conversation.branch}; stay on it. When you finish, any uncommitted changes are committed and the branch is pushed${conversation.openPr ? " with a pull request" : ""}, so do not push or open a pull request yourself.`
-      : "";
+    const note = `You are working in a checkout shared with other tasks, on its git branch ${conversation.branch}; stay on it, and do not switch branches, stash, or reset. When you finish, any uncommitted changes are committed and the branch is pushed${conversation.openPr ? " with a pull request" : ""}, so do not push or open a pull request yourself.`;
     const args = [
       "--print",
       "--input-format",
@@ -562,12 +648,13 @@ export class ConversationRunner {
       "stream-json",
       "--verbose",
       "--dangerously-skip-permissions",
-      ...(note ? ["--append-system-prompt", note] : []),
+      "--append-system-prompt",
+      note,
       ...(conversation.sessionStarted ? ["--resume", conversation.sessionId] : ["--session-id", conversation.sessionId]),
     ];
     this.throwIfCancelled(conversation);
     const child = spawn(this.options.claudeCommand, args, {
-      cwd: workdir,
+      cwd: this.options.workdir,
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
       detached: true,
@@ -657,15 +744,15 @@ export class ConversationRunner {
     return code === 0 && succeeded ? { ok: true } : { ok: false, error: failureReason(result, stderr, code) };
   }
 
-  private async publish(conversation: Conversation, workdir: string) {
-    await this.exec(conversation, "git", ["add", "--all"], workdir);
-    if ((await this.exec(conversation, "git", ["status", "--porcelain"], workdir)).trim()) {
-      await this.exec(conversation, "git", ["commit", "--message", conversation.title], workdir, {
+  private async publish(conversation: Conversation) {
+    await this.exec(conversation, "git", ["add", "--all"]);
+    if ((await this.exec(conversation, "git", ["status", "--porcelain"])).trim()) {
+      await this.exec(conversation, "git", ["commit", "--message", conversation.title], {
         error: "Could not commit the changes.",
       });
     }
     const ahead = Number(
-      await this.exec(conversation, "git", ["rev-list", "--count", `${conversation.baseCommit}..HEAD`], workdir),
+      await this.exec(conversation, "git", ["rev-list", "--count", `${conversation.baseCommit}..HEAD`]),
     );
     if (!ahead) {
       log.info("nothing to publish, no new commits", { conversation: conversation.id });
@@ -675,7 +762,6 @@ export class ConversationRunner {
       conversation,
       "git",
       ["push", "--set-upstream", "origin", `HEAD:refs/heads/${conversation.branch}`],
-      workdir,
       { error: "Could not push the branch." },
     );
     conversation.pushed = true;
@@ -687,7 +773,6 @@ export class ConversationRunner {
           conversation,
           this.options.ghCommand,
           ["pr", "view", conversation.branch!, "--json", "url", "--jq", ".url"],
-          workdir,
           { quiet: true },
         ).catch(() => ""),
       );
@@ -698,7 +783,6 @@ export class ConversationRunner {
             conversation,
             this.options.ghCommand,
             ["pr", "create", "--head", conversation.branch!, "--fill"],
-            workdir,
             { error: "Could not open the pull request." },
           ),
         );
@@ -709,24 +793,26 @@ export class ConversationRunner {
     }
   }
 
-  /** Runs a command as the conversation's current child, so cancel can stop it. */
+  /**
+   * Runs a command in the checkout as the conversation's current child, so cancel can stop it.
+   * Without a conversation (checking the checkout), it is not cancellable.
+   */
   private async exec(
-    conversation: Conversation,
+    conversation: Conversation | undefined,
     command: string,
     args: string[],
-    cwd?: string,
     /** `quiet` skips the failure log for commands that are expected to fail. */
     options: { error?: string; quiet?: boolean } = {},
   ): Promise<string> {
-    this.throwIfCancelled(conversation);
+    if (conversation) this.throwIfCancelled(conversation);
     const started = performance.now();
     const child = spawn(command, args, {
-      cwd,
+      cwd: this.options.workdir,
       env: { ...(this.options.env ?? process.env), GIT_TERMINAL_PROMPT: "0" },
       stdio: ["ignore", "pipe", "pipe"],
       detached: true,
     });
-    this.children.set(conversation.id, child);
+    if (conversation) this.children.set(conversation.id, child);
     let output = "";
     let errors = "";
     child.stdout.on("data", (chunk: Buffer) => {
@@ -736,13 +822,13 @@ export class ConversationRunner {
       errors = (errors + chunk.toString("utf8")).slice(-STDERR_TAIL);
     });
     const code = await exitCode(child);
-    this.children.delete(conversation.id);
+    if (conversation) this.children.delete(conversation.id);
     const name = `${path.basename(command)} ${args[0] ?? ""}`.trim();
-    log.debug("command ran", { conversation: conversation.id, command: name, exit: code, ms: since(started) });
+    log.debug("command ran", { conversation: conversation?.id, command: name, exit: code, ms: since(started) });
     if (code !== 0) {
-      if (!options.quiet && !this.cancelled.has(conversation.runs.at(-1)?.id ?? ""))
+      if (!options.quiet && !this.cancelled.has(conversation?.runs.at(-1)?.id ?? ""))
         log.warn("command failed", {
-          conversation: conversation.id,
+          conversation: conversation?.id,
           command: name,
           exit: code ?? "signal",
           stderr: errors.trim(),
@@ -851,9 +937,16 @@ function exitCode(child: ChildProcess) {
   });
 }
 
-async function exists(file: string) {
-  return stat(file).then(
-    () => true,
-    () => false,
-  );
+/**
+ * The origin's URL as a browser link: `git@github.com:org/repo.git` and
+ * `ssh://git@github.com/org/repo.git` become `https://github.com/org/repo`; an https URL loses
+ * its `.git`; anything else is kept as is.
+ */
+export function repositoryUrl(remote: string): string {
+  const url = remote.trim();
+  const scp = /^[\w.-]+@([\w.-]+):(.+)$/.exec(url);
+  if (scp) return `https://${scp[1]}/${scp[2]!.replace(/\.git$/, "")}`;
+  const ssh = /^ssh:\/\/(?:[\w.-]+@)?([\w.-]+)(?::\d+)?\/(.+)$/.exec(url);
+  if (ssh) return `https://${ssh[1]}/${ssh[2]!.replace(/\.git$/, "")}`;
+  return url.startsWith("https://") ? url.replace(/\.git$/, "") : url;
 }
