@@ -13,7 +13,7 @@ Its primary consumer is [Rakazo](https://rakazo.com)'s **Cloud Agent** integrati
 | Term | Meaning |
 | --- | --- |
 | **conversation** | One Claude Code session with its own branch and PR in the workspace's one checkout. Created by a launch, extended by follow-ups. Rakazo calls it an **agent**: the HTTP API also answers under `/agents/:id` for Rakazo, and the `agent/<id>` branch keeps that name. |
-| **checkout** | The one git checkout (`RUNNER_WORKDIR`) every conversation works in, the codebase the workspace builds and serves. One run at a time, because there is one checkout. |
+| **checkout** | The one git checkout (`RUNNER_WORKDIR`, default `~/src`) every conversation works in, the codebase the workspace builds and serves. One run at a time, because there is one checkout. |
 | **run** | One prompt sent to the conversation: one `claude --print` process with its own `runId` and status. |
 | **event** | One stream-json line a run printed (`system`, `assistant`, `user`, `result`, ...). |
 | **tool call** | A `tool_use` block from an assistant event, paired with its `tool_result`. |

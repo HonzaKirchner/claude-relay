@@ -20,7 +20,7 @@ Settings come from the environment, or from `.env` when started with `npm start`
 | --- | --- | --- |
 | `PORT` | `4115` | Listens on `127.0.0.1` only. |
 | `DB_CONNECTION_STRING` | – (required) | PostgreSQL URL. Every conversation, run, event and tool call is stored there and nowhere else. The service applies the schema on start and exits if the variable is missing or the database is unreachable. |
-| `RUNNER_WORKDIR` | – (required) | The git checkout every conversation works in. It needs an `origin` remote the workspace can fetch from and push to. The service exits if it is unset or not a checkout. |
+| `RUNNER_WORKDIR` | `~/src` | The git checkout every conversation works in. It needs an `origin` remote the workspace can fetch from and push to. The service exits if it is not a checkout. |
 | `RUNNER_BASE_BRANCH` | the origin's default branch | What a new conversation's branch starts from, unless the launch names a `baseBranch`. |
 | `CLAUDE_COMMAND` | `claude` | |
 | `GH_COMMAND` | `gh` | |
@@ -29,7 +29,7 @@ Settings come from the environment, or from `.env` when started with `npm start`
 
 ## Coder template
 
-The workspace needs `claude` logged in, `git` with an identity and push access, `gh` logged in for pull requests, and the codebase checked out at `RUNNER_WORKDIR` before the service starts. Claude Code refuses `--dangerously-skip-permissions` as root, so run the workspace as a normal user.
+The workspace needs `claude` logged in, `git` with an identity and push access, `gh` logged in for pull requests, and the codebase checked out at `~/src` (or `RUNNER_WORKDIR`) before the service starts. Claude Code refuses `--dangerously-skip-permissions` as root, so run the workspace as a normal user.
 
 Expose the runner as an app with the slug `claude` (Rakazo hard-codes this slug and calls it on Coder's path route, `/@owner/workspace/apps/claude/...`, which Coder serves for subdomain apps too unless path apps are disabled), shared with the owner only. The owner's Coder token is the only credential Rakazo needs:
 
@@ -47,7 +47,7 @@ resource "coder_script" "claude_relay" {
   agent_id     = coder_agent.main.id
   display_name = "claude-relay"
   run_on_start = true
-  script       = "RUNNER_WORKDIR=/home/coder/project nohup node /opt/claude-relay/src/index.ts >/tmp/claude-relay.log 2>&1 &"
+  script       = "nohup node /opt/claude-relay/src/index.ts >/tmp/claude-relay.log 2>&1 &"
 }
 ```
 
@@ -64,7 +64,7 @@ APP_URL=http://127.0.0.1:4115
 LOG_LEVEL=debug
 ```
 
-`RUNNER_WORKDIR` is a clone of whatever repository Claude should work on (`git clone <url> .data/checkout`); the service refuses to start without one.
+`RUNNER_WORKDIR` is a clone of whatever repository Claude should work on (`git clone <url> .data/checkout`); without it the service looks in `~/src` and refuses to start if that is not a checkout.
 
 Then:
 

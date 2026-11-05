@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { Store } from "./db.ts";
 import { createHandler } from "./http.ts";
@@ -11,15 +12,9 @@ if (!connectionString) {
   process.exit(1);
 }
 
-const workdir = process.env.RUNNER_WORKDIR;
-if (!workdir) {
-  log.error("RUNNER_WORKDIR is not set; it is the git checkout every conversation works in, so the service cannot start");
-  process.exit(1);
-}
-
 const options = {
   // The one git checkout Claude works in; all conversation data is in the database.
-  workdir: path.resolve(workdir),
+  workdir: path.resolve(process.env.RUNNER_WORKDIR || path.join(os.homedir(), "src")),
   baseBranch: process.env.RUNNER_BASE_BRANCH || undefined,
   claudeCommand: process.env.CLAUDE_COMMAND || "claude",
   ghCommand: process.env.GH_COMMAND || "gh",
