@@ -148,3 +148,6 @@ vite.config.ts.timestamp-*
 # Turbo Repo
 .turbo
 .env
+
+# Local RUNNER_DATA_DIR (git checkouts)
+.data/

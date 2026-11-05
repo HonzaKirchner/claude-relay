@@ -52,8 +52,37 @@ A stopped workspace is started by Rakazo on the next poll. Coder does not count 
 
 ## Development
 
+You need Node from `.nvmrc` and Docker. Put these settings in a `.env` in the repository root:
+
+```
+DB_CONNECTION_STRING=postgres://postgres:dev@127.0.0.1:5432/claude_relay
+RUNNER_DATA_DIR=./.data
+APP_URL=http://127.0.0.1:4115
+LOG_LEVEL=debug
+```
+
+Then:
+
 ```bash
 npm install
+npm run db:start   # PostgreSQL in Docker, matching DB_CONNECTION_STRING
+npm run db:seed    # optional: a few sample conversations
+npm run dev        # db:start, then the service, restarted on every change
+```
+
+Open <http://127.0.0.1:4115/ui/conversations>. A real launch runs `claude` on your machine and spends tokens, and with `repository` it pushes a branch (and opens a PR with `openPr`). Point `CLAUDE_COMMAND` and `GH_COMMAND` at stubs to avoid that.
+
+| Script | |
+| --- | --- |
+| `npm run dev` | Starts the database, then the service with `node --watch`. |
+| `npm run db:start` | Creates or starts the `claude-relay-pg` container and waits until it accepts connections. The user, password, database and port come from `DB_CONNECTION_STRING`. Its data is kept in the `claude-relay-pg-data` volume. |
+| `npm run db:stop` | Stops the container and keeps its data. |
+| `npm run db:reset` | Deletes the container and its data, then starts an empty one. |
+| `npm run db:seed` | Adds six sample conversations (ids starting with `seed-`): every finished status, a follow-up, tool calls, a steering message, a PR, and a long engineering run with 29 tool calls. Existing ones are skipped. |
+
+Before finishing a change:
+
+```bash
 npm run check
 npm test      # needs PostgreSQL: Docker, or TEST_DATABASE_URL
 ```

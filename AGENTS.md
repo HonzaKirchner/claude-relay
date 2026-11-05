@@ -32,6 +32,8 @@ Use these names in code and the database; use "agent" only where Rakazo's contra
 | `src/runner.test.ts` | End-to-end tests over HTTP with fake `claude` and `gh` scripts and a local git origin. | Needs PostgreSQL, see `test/postgres.ts`. |
 | `test/postgres.ts` | Vitest global setup: a throwaway test database (Docker, or a fresh database on `TEST_DATABASE_URL`). |
 | `scripts/import-files.ts` | `npm run db:import`: one-time import of conversations older versions kept in files. |
+| `scripts/db.ts` | `npm run db:start` / `db:stop` / `db:reset`: a local PostgreSQL in Docker matching `DB_CONNECTION_STRING`. |
+| `scripts/seed.ts` | `npm run db:seed`: sample conversations (`seed-*`) for the pages and API, written through `Store`. Keep its events shaped like real stream-json when the event handling changes. |
 
 ## Commands
 
@@ -42,6 +44,9 @@ npm install      # dev deps only: typescript, vitest, @types/node
 npm run check    # tsc --noEmit
 npm test         # vitest; needs PostgreSQL (Docker, or TEST_DATABASE_URL)
 npm start        # node src/index.ts
+npm run db:start # local PostgreSQL in Docker (see README "Development" for the .env)
+npm run db:seed  # sample conversations
+npm run dev      # db:start, then the service with --watch
 ```
 
 Run `npm run check` and `npm test` before finishing any change.
