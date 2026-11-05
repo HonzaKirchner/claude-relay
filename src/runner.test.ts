@@ -194,6 +194,17 @@ describe("claude code runner", () => {
     expect((await fetch(`${base}/ui/agents/linked`)).status).toBe(200);
     // Links handed out before the run id was dropped still open the page.
     expect((await fetch(`${base}/ui/conversations/linked?run=old`)).status).toBe(200);
+
+    // With no id, the page is the conversation list; links resolve against the URL served.
+    const list = await fetch(`${base}/ui/conversations`);
+    expect(list.status).toBe(200);
+    expect(list.headers.get("content-type")).toContain("text/html");
+    const listHtml = await list.text();
+    expect(listHtml).toContain('href="conversations/plain"');
+    expect(listHtml).toContain('href="conversations/linked"');
+    expect(listHtml).not.toContain('class="current"');
+    expect(await (await fetch(`${base}/ui/conversations/`)).text()).toContain('href="./linked"');
+    expect(await (await fetch(`${base}/ui/agents`)).text()).toContain('href="agents/linked"');
   });
 
   it("launches idempotently, pushes the branch and opens one pull request", async () => {

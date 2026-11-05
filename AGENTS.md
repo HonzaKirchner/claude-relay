@@ -26,7 +26,7 @@ Use these names in code and the database; use "agent" only where Rakazo's contra
 | `src/index.ts` | Entry point: reads env, loads state, listens on `127.0.0.1:$PORT`. |
 | `src/http.ts` | Routing, request validation, error → status mapping. |
 | `src/runner.ts` | `ConversationRunner`: per-conversation checkout, `claude` process, commit/push/PR, persistence. |
-| `src/ui.ts` | HTML conversation page served at `/ui/conversations/:id`. |
+| `src/ui.ts` | HTML pages served at `/ui/conversations/:id` and `/ui/conversations` (the list). |
 | `src/db.ts` | `Store`: the PostgreSQL store, the only place conversations, runs, events and tool calls are kept (`db/schema.sql`). Required: the service exits without `DB_CONNECTION_STRING` or a reachable database. |
 | `src/log.ts` | One-line `key=value` logger, filtered by `LOG_LEVEL`. |
 | `src/runner.test.ts` | End-to-end tests over HTTP with fake `claude` and `gh` scripts and a local git origin. | Needs PostgreSQL, see `test/postgres.ts`. |
@@ -83,7 +83,8 @@ The canonical paths start with `/conversations`. Every one of them is also serve
 | `GET /conversations/:id` | – | Latest run. |
 | `GET /conversations/:id/runs/:runId` | – | A specific run. |
 | `POST /conversations/:id/runs` | `PromptRequest` | Starts a follow-up that resumes the same Claude session. `409 busy` while a run is going. |
-| `GET /ui/conversations/:id` | – | HTML page with the conversation, for people. The only non-JSON success response; Rakazo never calls it. |
+| `GET /ui/conversations/:id` | – | HTML page with the conversation and a sidebar listing every conversation, for people. Rakazo never calls it. |
+| `GET /ui/conversations` | – | HTML page with just the conversation list. Together with the page above, the only non-JSON success responses. |
 | `POST /conversations/:id/runs/:runId/cancel` | `{}` | Stops the run and **responds only once it has stopped**, with the final state. Cancelling a finished run returns it unchanged. |
 
 ```ts
