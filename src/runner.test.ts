@@ -316,8 +316,12 @@ describe("claude code runner", () => {
       summary: "Done: Add a file",
     });
     expect(git(origin, "log", "--format=%s", "agent/agent-1")).toContain("Add a file");
+    // The pushed branch links to the branch on GitHub.
+    expect(await (await fetch(`${base}/ui/conversations/agent-1`)).text()).toContain(
+      `<a href="${REPOSITORY}/tree/agent/agent-1" target="_blank" rel="noopener"><code>agent/agent-1</code></a>`,
+    );
 
-    const followup = await call("POST", "/agents/agent-1/runs", { prompt: "And another" });
+    const followup =await call("POST", "/agents/agent-1/runs", { prompt: "And another" });
     expect(followup.body.runId).not.toBe(first.body.runId);
     await runner.idle();
     // An older run keeps its own summary but points at the latest run.

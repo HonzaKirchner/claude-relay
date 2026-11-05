@@ -221,7 +221,7 @@ function statsPanel(transcript: Transcript): string {
   <div class="panel-title">Repository</div>
   <ul class="links">
     ${transcript.repository ? `<li>${ICONS.repo}${link(transcript.repository, repoName(transcript.repository))}</li>` : ""}
-    ${transcript.branch ? `<li>${ICONS.branch}<code>${escape(transcript.branch)}</code>${transcript.pushed ? "" : '<span class="hint">not pushed</span>'}</li>` : ""}
+    ${transcript.branch ? `<li>${ICONS.branch}${branchLink(transcript.repository, transcript.branch, transcript.pushed)}${transcript.pushed ? "" : '<span class="hint">not pushed</span>'}</li>` : ""}
     ${transcript.prUrl ? `<li>${ICONS.pr}${link(transcript.prUrl, prName(transcript.prUrl))}</li>` : ""}
   </ul>
 </section>`);
@@ -852,6 +852,20 @@ function relative(path: string, cwd: string | undefined): string {
 
 function repoName(url: string): string {
   return url.replace(/^https?:\/\/[^/]+\//, "").replace(/\.git$/, "");
+}
+
+/**
+ * The branch name, linked to the branch on its host once it has been pushed. Only GitHub and
+ * GitLab URLs are known; any other host shows the name without a link.
+ */
+function branchLink(repository: string | undefined, branch: string, pushed: boolean): string {
+  const name = `<code>${escape(branch)}</code>`;
+  const match = repository && pushed ? /^(https:\/\/([^/]+)\/.+?)(?:\.git)?\/?$/.exec(repository) : null;
+  if (!match) return name;
+  const [, base, host] = match;
+  const path = branch.split("/").map(encodeURIComponent).join("/");
+  const url = host === "github.com" ? `${base}/tree/${path}` : host!.startsWith("gitlab.") ? `${base}/-/tree/${path}` : undefined;
+  return url ? `<a href="${escape(url)}" target="_blank" rel="noopener">${name}</a>` : name;
 }
 
 function prName(url: string): string {
