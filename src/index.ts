@@ -13,8 +13,9 @@ if (!connectionString) {
 }
 
 const options = {
-  // The one git checkout Claude works in; all conversation data is in the database.
-  workdir: path.resolve(process.env.RUNNER_WORKDIR || path.join(os.homedir(), "src")),
+  // Holds the checkouts Claude works in, one per repository (or is one checkout itself); all
+  // conversation data is in the database.
+  root: path.resolve(process.env.RUNNER_WORKDIR || path.join(os.homedir(), "src")),
   baseBranch: process.env.RUNNER_BASE_BRANCH || undefined,
   claudeCommand: process.env.CLAUDE_COMMAND || "claude",
   ghCommand: process.env.GH_COMMAND || "gh",
@@ -23,7 +24,7 @@ const options = {
   publicUrl: process.env.APP_URL || undefined,
 };
 log.info("starting", {
-  workdir: options.workdir,
+  root: options.root,
   baseBranch: options.baseBranch ?? "the origin's default branch",
   claude: options.claudeCommand,
   gh: options.ghCommand,

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Server } from "node:http";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -15,7 +15,10 @@ import { ConversationRunner } from "./runner.ts";
 // Quiet by default; run `LOG_LEVEL=info npm test` to see the service's log.
 process.env.LOG_LEVEL ??= "silent";
 
+/** Checked out under the root as `demo`; launches name it unless they say otherwise. */
 const REPOSITORY = "https://github.com/example/demo";
+/** A second repository, checked out under the root as `other`. */
+const OTHER = "https://github.com/example/other";
 
 // Stands in for Claude Code: reads stream-json user messages line by line, behaves as the first
 // one says, and exits once stdin is closed (and nothing else keeps it going).
@@ -102,8 +105,10 @@ function start(text) {
 }
 `;
 
+// Opens the PR in the repository it runs in: the checkouts are named after their repositories.
 const FAKE_GH = `
-if (process.argv[2] === "pr" && process.argv[3] === "create") console.log("${REPOSITORY}/pull/7");
+if (process.argv[2] === "pr" && process.argv[3] === "create")
+  console.log("https://github.com/example/" + require("node:path").basename(process.cwd()) + "/pull/7");
 else process.exit(1);
 `;
 
@@ -112,9 +117,14 @@ let server: Server;
 let runner: ConversationRunner;
 let store: Store;
 let base: string;
+/** The bare origins of the two repositories. */
 let origin: string;
-/** The one checkout every conversation works in, cloned from `origin`. */
+let otherOrigin: string;
+/** Holds the checkouts, as `~/src` does in the workspace. */
+let root: string;
+/** The checkout of `REPOSITORY`, `<root>/demo`, and of `OTHER`, `<root>/other`. */
 let checkout: string;
+let other: string;
 
 function script(name: string, source: string) {
   const js = path.join(dir, `${name}.cjs`);
@@ -140,13 +150,19 @@ const identity = {
   GIT_COMMITTER_EMAIL: "test@example.com",
 };
 
-async function start(options: { publicUrl?: string; baseBranch?: string } = {}) {
+interface StartOptions {
+  publicUrl?: string;
+  baseBranch?: string;
+  root?: string;
+}
+
+async function start(options: StartOptions = {}) {
   store = new Store(inject("databaseUrl"));
   await store.migrate();
   runner = new ConversationRunner({
     store,
+    root,
     ...options,
-    workdir: checkout,
     claudeCommand: script("claude", FAKE_CLAUDE),
     ghCommand: script("gh", FAKE_GH),
     steerIdleMs: 300,
@@ -155,10 +171,12 @@ async function start(options: { publicUrl?: string; baseBranch?: string } = {}) 
       ...identity,
       FAKE_CLAUDE_LOG: path.join(dir, "claude.log"),
       FAKE_CLAUDE_GATE: path.join(dir, "gate"),
-      // The checkout's origin is the example repository's URL; git reaches the local origin instead.
-      GIT_CONFIG_COUNT: "1",
+      // The checkouts' origins are the example repositories' URLs; git reaches the local origins instead.
+      GIT_CONFIG_COUNT: "2",
       GIT_CONFIG_KEY_0: `url.${origin}.insteadOf`,
       GIT_CONFIG_VALUE_0: REPOSITORY,
+      GIT_CONFIG_KEY_1: `url.${otherOrigin}.insteadOf`,
+      GIT_CONFIG_VALUE_1: OTHER,
     },
   });
   await runner.load();
@@ -168,14 +186,30 @@ async function start(options: { publicUrl?: string; baseBranch?: string } = {}) 
 }
 
 /** Like a service restart: everything the new runner knows comes from the database. */
-async function restart(options: { publicUrl?: string; baseBranch?: string } = {}) {
+async function restart(options: StartOptions = {}) {
   await stop();
   await start(options);
 }
 
 /** The files on a branch of the origin. */
-function filesOn(branch: string) {
-  return git(origin, "ls-tree", "--name-only", branch).trim().split("\n").sort();
+function filesOn(branch: string, from = origin) {
+  return git(from, "ls-tree", "--name-only", branch).trim().split("\n").sort();
+}
+
+/** A bare repository with one commit on `main`, and a clone of it under the root whose origin is `url`. */
+function repository(name: string, url: string) {
+  const bare = path.join(dir, `${name}.git`);
+  const seed = path.join(dir, `${name}-seed`);
+  git(dir, "init", "--bare", "--initial-branch=main", bare);
+  git(dir, "init", "--initial-branch=main", seed);
+  writeFileSync(path.join(seed, "README.md"), `${name}\n`);
+  git(seed, "add", ".");
+  git(seed, "commit", "-m", "init");
+  git(seed, "push", bare, "main");
+  // As the Coder template has it: cloned from the repository, named after it.
+  git(root, "clone", "--quiet", bare, name);
+  git(path.join(root, name), "remote", "set-url", "origin", url);
+  return { bare, seed };
 }
 
 async function stop() {
@@ -233,6 +267,15 @@ async function openStream(pathname: string) {
   };
 }
 
+/** Polls until the conversation's latest run has ended; `runner.idle()` would wait for every run. */
+async function finished(id: string) {
+  for (;;) {
+    const { body } = await call("GET", `/conversations/${id}`);
+    if (body.status !== "running") return body;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 /** The arguments of every `claude` invocation so far, in order. */
 function claudeCalls() {
   return readFileSync(path.join(dir, "claude.log"), "utf8")
@@ -241,11 +284,13 @@ function claudeCalls() {
     .map((line) => JSON.parse(line) as string[]);
 }
 
+/** A launch (PUT) names `REPOSITORY` unless the body says otherwise (`repository: undefined` names none). */
 async function call(method: string, pathname: string, body?: unknown) {
+  const sent = method === "PUT" && body !== undefined ? { repository: REPOSITORY, ...(body as object) } : body;
   const response = await fetch(`${base}${pathname}`, {
     method,
     headers: { "content-type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body),
+    body: sent === undefined ? undefined : JSON.stringify(sent),
   });
   const json = (await response.json()) as Partial<ConversationView> & { code?: string };
   return { status: response.status, body: json };
@@ -253,24 +298,19 @@ async function call(method: string, pathname: string, body?: unknown) {
 
 beforeEach(async () => {
   dir = mkdtempSync(path.join(os.tmpdir(), "claude-code-runner-"));
-  origin = path.join(dir, "origin.git");
-  const seed = path.join(dir, "seed");
-  git(dir, "init", "--bare", "--initial-branch=main", origin);
-  git(dir, "init", "--initial-branch=main", seed);
-  writeFileSync(path.join(seed, "README.md"), "demo\n");
-  git(seed, "add", ".");
-  git(seed, "commit", "-m", "init");
-  git(seed, "push", origin, "main");
+  root = path.join(dir, "root");
+  mkdirSync(root);
+  const demo = repository("demo", REPOSITORY);
+  origin = demo.bare;
+  checkout = path.join(root, "demo");
   // A second branch, for conversations that name their base.
-  git(seed, "checkout", "-b", "release");
-  writeFileSync(path.join(seed, "RELEASE.md"), "release\n");
-  git(seed, "add", ".");
-  git(seed, "commit", "-m", "release");
-  git(seed, "push", origin, "release");
-  // The checkout the service works in, as the Coder template has it: cloned from the repository.
-  checkout = path.join(dir, "checkout");
-  git(dir, "clone", "--quiet", origin, checkout);
-  git(checkout, "remote", "set-url", "origin", REPOSITORY);
+  git(demo.seed, "checkout", "-b", "release");
+  writeFileSync(path.join(demo.seed, "RELEASE.md"), "release\n");
+  git(demo.seed, "add", ".");
+  git(demo.seed, "commit", "-m", "release");
+  git(demo.seed, "push", origin, "release");
+  otherOrigin = repository("other", OTHER).bare;
+  other = path.join(root, "other");
   // Applies the schema, then every test starts from empty tables.
   const setup = new Store(inject("databaseUrl"));
   await setup.migrate();
@@ -364,7 +404,7 @@ describe("claude code runner", () => {
     expect((await call("GET", "/agents/agent-1")).body.summary).toBe("Done: And another");
     expect(git(origin, "log", "--format=%s", "agent/agent-1")).toContain("Add a file");
     expect(filesOn("agent/agent-1")).toHaveLength(3);
-    // The work happened in the one checkout, which is left on the conversation's branch.
+    // The work happened in the repository's checkout, which is left on the conversation's branch.
     expect(git(checkout, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/agent-1");
     expect(git(checkout, "status", "--porcelain")).toBe("");
 
@@ -375,9 +415,9 @@ describe("claude code runner", () => {
     expect(launchArgs![launchArgs!.indexOf("--append-system-prompt") + 1]).toContain("branch agent/agent-1");
   });
 
-  it("runs one conversation at a time and cancels a run", async () => {
+  it("runs one conversation at a time per checkout and cancels a run", async () => {
     const launched = await call("PUT", "/conversations/busy", { prompt: "hang" });
-    // One checkout: while a run is going, nothing else starts, in this conversation or another.
+    // One checkout per repository: while a run is going in it, nothing else starts there.
     expect(await call("POST", "/conversations/busy/runs", { prompt: "More" })).toEqual({
       status: 409,
       body: { code: "busy", reason: "locked", conversation: "busy" },
@@ -399,6 +439,110 @@ describe("claude code runner", () => {
     expect((await call("POST", "/conversations/busy/runs", { prompt: "Again" })).status).toBe(200);
     await runner.idle();
     expect((await call("GET", "/conversations/busy")).body.status).toBe("finished");
+  });
+
+  it("works in the checkout of the launch's repository, side by side with other repositories", async () => {
+    const demoRun = await call("PUT", "/conversations/demo-1", { prompt: "hang" });
+    // The other repository's checkout is free, so its run goes while demo's is going.
+    const otherRun = await call("PUT", "/conversations/other-1", { prompt: "hang", repository: OTHER });
+    expect(otherRun.body.status).toBe("running");
+    // Each checkout refuses with the conversation holding it.
+    expect(await call("PUT", "/conversations/demo-2", { prompt: "hi" })).toEqual({
+      status: 409,
+      body: { code: "busy", reason: "locked", conversation: "demo-1" },
+    });
+    expect(await call("PUT", "/conversations/other-2", { prompt: "hi", repository: `${OTHER}.git` })).toEqual({
+      status: 409,
+      body: { code: "busy", reason: "locked", conversation: "other-1" },
+    });
+    expect((await call("POST", "/conversations/demo-1/runs", { prompt: "more" })).body).toMatchObject({ conversation: "demo-1" });
+    await call("POST", `/conversations/other-1/runs/${otherRun.body.runId}/cancel`);
+
+    // `.git` and case are not a different repository.
+    await call("PUT", "/conversations/other-2", { prompt: "Add a file", repository: "https://github.com/Example/other.git", openPr: true });
+    expect(await finished("other-2")).toMatchObject({
+      status: "finished",
+      branch: "agent/other-2",
+      prUrl: `${OTHER}/pull/7`,
+    });
+    expect(filesOn("agent/other-2", otherOrigin)).toEqual(["README.md", expect.stringMatching(/^change-/)]);
+    expect(git(other, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/other-2");
+    expect(await sql("SELECT repository FROM conversations WHERE id = 'other-2'")).toEqual([{ repository: "https://github.com/Example/other" }]);
+    // Demo's checkout was never touched: still on its own running conversation's branch.
+    expect(git(checkout, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/demo-1");
+    expect((await call("GET", "/conversations/demo-1")).body.status).toBe("running");
+    await call("POST", `/conversations/demo-1/runs/${demoRun.body.runId}/cancel`);
+    expect(() => git(origin, "rev-parse", "--verify", "agent/other-2")).toThrow();
+  });
+
+  it("refuses a launch for a repository that is not checked out under the root", async () => {
+    expect(await call("PUT", "/conversations/missing", { prompt: "hi", repository: "https://github.com/example/missing.git" })).toEqual({
+      status: 400,
+      body: { code: "invalid", reason: "no_checkout", path: path.join(root, "missing"), repository: "https://github.com/example/missing" },
+    });
+    expect((await call("GET", "/conversations/missing")).status).toBe(404);
+    // A directory that is no checkout, and a checkout of some other repository under that name.
+    mkdirSync(path.join(root, "plain"));
+    expect((await call("PUT", "/conversations/plain", { prompt: "hi", repository: "https://github.com/example/plain" })).body).toEqual({
+      code: "invalid",
+      reason: "no_checkout",
+      path: path.join(root, "plain"),
+      repository: "https://github.com/example/plain",
+    });
+    git(root, "clone", "--quiet", origin, "wrong");
+    git(path.join(root, "wrong"), "remote", "set-url", "origin", REPOSITORY);
+    expect((await call("PUT", "/conversations/wrong", { prompt: "hi", repository: "https://github.com/example/wrong" })).body).toEqual({
+      code: "invalid",
+      reason: "no_checkout",
+      path: path.join(root, "wrong"),
+      repository: "https://github.com/example/wrong",
+      found: REPOSITORY,
+    });
+    // Without a repository, the root itself would have to be a checkout.
+    expect(await call("PUT", "/conversations/none", { prompt: "hi", repository: undefined })).toEqual({
+      status: 400,
+      body: { code: "invalid", reason: "no_checkout", path: root },
+    });
+    expect(() => claudeCalls()).toThrow();
+
+    // A follow-up needs the checkout too. Cloned again, the conversation goes on from its pushed branch.
+    await call("PUT", "/conversations/gone", { prompt: "First", repository: OTHER });
+    await runner.idle();
+    rmSync(other, { recursive: true, force: true });
+    expect((await call("POST", "/conversations/gone/runs", { prompt: "Second" })).body).toMatchObject({
+      code: "invalid",
+      reason: "no_checkout",
+      path: other,
+      repository: OTHER,
+    });
+    expect((await call("GET", "/conversations/gone")).body.status).toBe("finished");
+    git(root, "clone", "--quiet", otherOrigin, "other");
+    git(other, "remote", "set-url", "origin", OTHER);
+    await call("POST", "/conversations/gone/runs", { prompt: "Second" });
+    await runner.idle();
+    expect((await call("GET", "/conversations/gone")).body.status).toBe("finished");
+    expect(filesOn("agent/gone", otherOrigin)).toHaveLength(3);
+  });
+
+  it("works in the root itself when it is the checkout", async () => {
+    // A workspace with one checkout: launches with and without that repository work in it.
+    await restart({ root: checkout });
+    await call("PUT", "/conversations/bare", { prompt: "No repository", repository: undefined });
+    await runner.idle();
+    await call("PUT", "/conversations/named", { prompt: "Named" });
+    await runner.idle();
+    expect(await sql("SELECT id, repository, pushed FROM conversations ORDER BY id")).toEqual([
+      { id: "bare", repository: REPOSITORY, pushed: true },
+      { id: "named", repository: REPOSITORY, pushed: true },
+    ]);
+    expect(filesOn("agent/bare")).toHaveLength(2);
+    expect(git(checkout, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/named");
+    expect((await call("PUT", "/conversations/elsewhere", { prompt: "hi", repository: OTHER })).body).toEqual({
+      code: "invalid",
+      reason: "no_checkout",
+      path: path.join(checkout, "other"),
+      repository: OTHER,
+    });
   });
 
   it("refuses runs while the checkout has leftovers, unless they are the conversation's own", async () => {
@@ -547,7 +691,7 @@ describe("claude code runner", () => {
     const otherStore = new Store(inject("databaseUrl"));
     const restarted = new ConversationRunner({
       store: otherStore,
-      workdir: checkout,
+      root,
       claudeCommand: "claude",
       ghCommand: "gh",
     });
@@ -568,7 +712,7 @@ describe("claude code runner", () => {
     await call("POST", "/conversations/kept/runs", { prompt: "refuse" });
     await runner.idle();
 
-    // The launch's `repository` is ignored: the conversation's is the checkout's origin.
+    // The launch's `repository` names the checkout, and is the conversation's.
     expect(await sql("SELECT id, title, repository, branch, session_started, pushed, pr_url, base_commit IS NOT NULL AS has_base FROM conversations")).toEqual([
       { id: "kept", title: "Add a file", repository: REPOSITORY, branch: "agent/kept", session_started: true, pushed: true, pr_url: `${REPOSITORY}/pull/7`, has_base: true },
     ]);
@@ -730,6 +874,9 @@ describe("claude code runner", () => {
     expect(
       (await call("PUT", "/conversations/bad", { prompt: "x", repository: "file:///etc" })).status,
     ).toBe(400);
+    // A repository URL has to name a directory under the root.
+    expect((await call("PUT", "/conversations/bad", { prompt: "x", repository: "https://github.com/" })).status).toBe(400);
+    expect((await call("PUT", "/conversations/bad", { prompt: "x", repository: "https://github.com/a/.." })).status).toBe(400);
     expect((await call("GET", "/conversations/missing")).body).toEqual({ code: "not_found" });
     expect((await call("GET", "/conversations/bad%2F..")).status).toBe(404);
   });

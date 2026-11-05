@@ -2,9 +2,9 @@
 
 A small HTTP service that runs headless Claude Code sessions inside a Coder workspace. [Rakazo](https://rakazo.com)'s `coder` [cloud agent provider](https://rakazo.com/docs/self-host-integrations/#cloud-coding-agents) talks to it through Coder's app proxy, so Claude Code uses whatever login the workspace has.
 
-Every conversation (an "agent" in Rakazo and the API) works in the workspace's one git checkout, the codebase the workspace builds and serves, on its own branch `agent/<id>` and in its own Claude Code session. Follow-ups resume that session. Because there is one checkout, one run goes at a time: a launch or follow-up while another run is going is refused with `409 busy` (`reason: "locked"`), not queued. When a run finishes, the runner commits leftover changes, pushes the branch, and opens a pull request with `gh` if the launch asked for one. The checkout stays on that branch, so what the workspace serves is the latest conversation's work.
+The workspace holds a git checkout per repository under one directory, `~/src` by default: `~/src/apify-core` for `https://github.com/apify/apify-core`. Every conversation (an "agent" in Rakazo and the API) works in the checkout of the repository its launch names, on its own branch `agent/<id>` and in its own Claude Code session. Follow-ups resume that session. A checkout is shared by every conversation of its repository, so one run goes at a time in it: a launch or follow-up while another run is going there is refused with `409 busy` (`reason: "locked"`), not queued. Runs in different repositories go side by side. When a run finishes, the runner commits leftover changes, pushes the branch, and opens a pull request with `gh` if the launch asked for one. The checkout stays on that branch, so what the workspace builds and serves from it is the latest conversation's work.
 
-A failed or cancelled run leaves its changes in the checkout. Its own conversation goes on from them; any other request is refused with `409 busy` (`reason: "dirty"`) until someone commits, stashes or discards them. The same goes for changes a person made in the checkout by hand.
+A launch for a repository that is not cloned under the directory (or cloned from somewhere else under that name) is refused with `400 invalid` (`reason: "no_checkout"`); someone has to clone it in the workspace. A failed or cancelled run leaves its changes in the checkout. Its own conversation goes on from them; any other request for that checkout is refused with `409 busy` (`reason: "dirty"`) until someone commits, stashes or discards them. The same goes for changes a person made in the checkout by hand.
 
 ## Run it
 
@@ -20,7 +20,7 @@ Settings come from the environment, or from `.env` when started with `npm start`
 | --- | --- | --- |
 | `PORT` | `4115` | Listens on `127.0.0.1` only. |
 | `DB_CONNECTION_STRING` | – (required) | PostgreSQL URL. Every conversation, run, event and tool call is stored there and nowhere else. The service applies the schema on start and exits if the variable is missing or the database is unreachable. |
-| `RUNNER_WORKDIR` | `~/src` | The git checkout every conversation works in. It needs an `origin` remote the workspace can fetch from and push to. The service exits if it is not a checkout. |
+| `RUNNER_WORKDIR` | `~/src` | The directory holding the checkouts, one per repository and named after it: the last segment of the repository URL without `.git`. Each needs an `origin` remote the workspace can fetch from and push to, and it must be that repository. The directory can also be one checkout itself: launches that name its repository, or none, work in it. The service exits if the directory does not exist; whether a repository is checked out is checked per launch. |
 | `RUNNER_BASE_BRANCH` | the origin's default branch | What a new conversation's branch starts from, unless the launch names a `baseBranch`. |
 | `CLAUDE_COMMAND` | `claude` | |
 | `GH_COMMAND` | `gh` | |
@@ -29,7 +29,7 @@ Settings come from the environment, or from `.env` when started with `npm start`
 
 ## Coder template
 
-The workspace needs `claude` logged in, `git` with an identity and push access, `gh` logged in for pull requests, and the codebase checked out at `~/src` (or `RUNNER_WORKDIR`) before the service starts. Claude Code refuses `--dangerously-skip-permissions` as root, so run the workspace as a normal user.
+The workspace needs `claude` logged in, `git` with an identity and push access, `gh` logged in for pull requests, and every repository Rakazo may send cloned under `~/src` (or `RUNNER_WORKDIR`), each in a directory named after it. A repository cloned later is picked up by the next launch. Claude Code refuses `--dangerously-skip-permissions` as root, so run the workspace as a normal user.
 
 Expose the runner as an app with the slug `claude` (Rakazo hard-codes this slug and calls it on Coder's path route, `/@owner/workspace/apps/claude/...`, which Coder serves for subdomain apps too unless path apps are disabled), shared with the owner only. The owner's Coder token is the only credential Rakazo needs:
 
@@ -59,12 +59,12 @@ You need Node from `.nvmrc` and Docker. Put these settings in a `.env` in the re
 
 ```
 DB_CONNECTION_STRING=postgres://postgres:dev@127.0.0.1:5432/claude_relay
-RUNNER_WORKDIR=./.data/checkout
+RUNNER_WORKDIR=./.data/src
 APP_URL=http://127.0.0.1:4115
 LOG_LEVEL=debug
 ```
 
-`RUNNER_WORKDIR` is a clone of whatever repository Claude should work on (`git clone <url> .data/checkout`); without it the service looks in `~/src` and refuses to start if that is not a checkout.
+`RUNNER_WORKDIR` holds a clone of every repository Claude should work on, named after it (`git clone https://github.com/example/demo .data/src/demo`); a launch for a repository that is not there is refused. Without the variable the service looks in `~/src`, and refuses to start if that does not exist.
 
 Then:
 
@@ -106,17 +106,17 @@ Older versions also gave each conversation a clone of its own under that directo
 
 ## API
 
-All bodies are JSON. Errors are `{ "code": "invalid" | "not_found" | "busy" | "not_running" | "internal" }`. A `busy` body also says why: `{ "reason": "locked", "conversation" }` when a run is going, in any conversation, naming whose; `{ "reason": "dirty", "branch" }` when the checkout has uncommitted changes that are not the conversation's own, naming the branch it is on.
+All bodies are JSON. Errors are `{ "code": "invalid" | "not_found" | "busy" | "not_running" | "internal" }`. A `busy` body also says why: `{ "reason": "locked", "conversation" }` when a run is going in the checkout, in any conversation, naming whose; `{ "reason": "dirty", "branch" }` when the checkout has uncommitted changes that are not the conversation's own, naming the branch it is on. An `invalid` body with `{ "reason": "no_checkout", "path", "repository"?, "found"? }` means the repository is not checked out at `path` (or `found`, another repository, is).
 
 Every `/conversations` path is also served under `/agents`, the name Rakazo uses for a conversation.
 
 | | |
 | --- | --- |
 | `GET /health` | `{ ok: true }`. |
-| `PUT /conversations/:id` | `{ prompt, images?, repository?, openPr?, baseBranch? }`. Creates the conversation and its first run on a branch from `baseBranch` (default: `RUNNER_BASE_BRANCH`, else the origin's default branch); repeating it returns the existing conversation. `repository` is accepted for Rakazo and ignored. `409 busy` while any run is going or the checkout has uncommitted changes. |
+| `PUT /conversations/:id` | `{ prompt, images?, repository?, openPr?, baseBranch? }`. Creates the conversation and its first run in the checkout of `repository` (an https URL; `<RUNNER_WORKDIR>/<last segment>`, or `RUNNER_WORKDIR` itself when that is a checkout of it; without `repository`, `RUNNER_WORKDIR` must be a checkout), on a branch from `baseBranch` (default: `RUNNER_BASE_BRANCH`, else the origin's default branch); repeating it returns the existing conversation. `400 invalid` (`reason: "no_checkout"`) when the repository is not checked out there. `409 busy` while a run is going in that checkout or it has uncommitted changes. |
 | `GET /conversations/:id` | The latest run. |
 | `GET /conversations/:id/runs/:runId` | A specific run. |
-| `POST /conversations/:id/runs` | `{ prompt, images? }`. Starts a follow-up; `409 busy` while any run is going or the checkout has changes that are not this conversation's own. |
+| `POST /conversations/:id/runs` | `{ prompt, images? }`. Starts a follow-up in the conversation's checkout; `409 busy` while a run is going there or it has changes that are not this conversation's own; `400 invalid` (`reason: "no_checkout"`) when the checkout is gone. |
 | `POST /conversations/:id/runs/:runId/cancel` | Stops the run and returns once it has stopped. |
 | `POST /conversations/:id/runs/:runId/messages` | Steers a running run: `{ prompt, images? }` is stored and written to Claude's stdin, and Claude reads it at its next step. `409 not_running` once the run has ended or no longer takes messages. |
 
