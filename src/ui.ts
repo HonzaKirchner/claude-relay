@@ -51,7 +51,38 @@ ${running ? `<script>${LIVE_SCRIPT}</script>` : ""}
 </html>`;
 }
 
-function conversationList(conversations: ConversationSummary[], currentId: string): string {
+/**
+ * The page behind `/ui/conversations`: the conversation sidebar on its own, no conversation
+ * open. `hrefPrefix` makes the links relative to the URL the page was served at, so they keep
+ * working behind Coder's app proxy.
+ */
+export function conversationsPage(conversations: ConversationSummary[], hrefPrefix: string): string {
+  const running = conversations.some((conversation) => conversation.status === "running");
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<noscript>${running ? '<meta http-equiv="refresh" content="5">' : ""}</noscript>
+<title>Conversations</title>
+<style>${STYLE}</style>
+</head>
+<body${running ? " data-running" : ""}>
+<div class="layout index">
+<aside class="sidebar left" aria-label="Conversations">
+<div class="sidebar-head"><span class="spark">${ICONS.spark}</span><span>Conversations</span></div>
+<nav id="conversations">${conversationList(conversations, undefined, hrefPrefix)}</nav>
+</aside>
+<div class="center">
+<main><p class="empty">${conversations.length ? "Select a conversation." : "No conversations yet."}</p></main>
+</div>
+</div>
+${running ? `<script>${LIVE_SCRIPT}</script>` : ""}
+</body>
+</html>`;
+}
+
+function conversationList(conversations: ConversationSummary[], currentId?: string, hrefPrefix = "./"): string {
   if (!conversations.length) return '<p class="empty">No conversations yet.</p>';
   const now = Date.now();
   return `<ul class="conversations">${conversations
@@ -62,7 +93,7 @@ function conversationList(conversations: ConversationSummary[], currentId: strin
         `${conversation.runCount} run${conversation.runCount === 1 ? "" : "s"}`,
         conversation.repository ? repoName(conversation.repository) : "",
       ].filter(Boolean);
-      return `<li><a href="./${encodeURIComponent(conversation.id)}"${current ? ' class="current" aria-current="page"' : ""}><span class="dot ${conversation.status}" title="${conversation.status}"></span><span class="conv-text"><span class="conv-title">${escape(conversation.title)}</span><span class="conv-meta">${escape(meta.join(" · "))}</span></span></a></li>`;
+      return `<li><a href="${hrefPrefix}${encodeURIComponent(conversation.id)}"${current ? ' class="current" aria-current="page"' : ""}><span class="dot ${conversation.status}" title="${conversation.status}"></span><span class="conv-text"><span class="conv-title">${escape(conversation.title)}</span><span class="conv-meta">${escape(meta.join(" · "))}</span></span></a></li>`;
     })
     .join("")}</ul>`;
 }
@@ -749,6 +780,7 @@ const STYLE = `
   .muted { color: var(--muted); } .small { font-size: 13px; }
 
   .layout { display: grid; grid-template-columns: 320px minmax(0, 1fr) 360px; min-height: 100vh; }
+  .layout.index { grid-template-columns: 320px minmax(0, 1fr); }
   .center { min-width: 0; }
   .toggle { position: absolute; opacity: 0; pointer-events: none; }
   .sidebar { position: sticky; top: 0; height: 100vh; overflow-y: auto; background: var(--sidebar); font-size: 14px; display: flex; flex-direction: column; }
@@ -827,6 +859,10 @@ const STYLE = `
     #toggle-nav:checked ~ .layout .sidebar.left { transform: none; }
     #toggle-nav:checked ~ .scrim:not(.stats-scrim) { display: block; }
     .nav-button, .sidebar.left .close { display: inline-flex; }
+    /* With no conversation open, the list is the page. */
+    .layout.index { grid-template-columns: minmax(0, 1fr); }
+    .layout.index .sidebar.left { position: static; width: auto; height: auto; min-height: 100vh; transform: none; box-shadow: none; border-right: 0; }
+    .layout.index .center { display: none; }
   }
   .scrim { position: fixed; inset: 0; z-index: 9; background: rgba(0, 0, 0, .3); }
   @media (prefers-reduced-motion: reduce) { .dot.running { animation: none; } .sidebar { transition: none !important; } }

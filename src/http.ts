@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ConversationView, ConversationRunner, Image, LaunchRequest, PromptRequest } from "./runner.ts";
 import { log, since } from "./log.ts";
 import { ConversationBusy } from "./runner.ts";
-import { transcriptPage } from "./ui.ts";
+import { conversationsPage, transcriptPage } from "./ui.ts";
 
 const MAX_BODY_BYTES = 128 * 1024 * 1024;
 const MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
@@ -15,6 +15,7 @@ const RUNS = new RegExp(`^${BASE}/(${ID})/runs$`);
 const RUN = new RegExp(`^${BASE}/(${ID})/runs/(${ID})$`);
 const CANCEL = new RegExp(`^${BASE}/(${ID})/runs/(${ID})/cancel$`);
 const UI = new RegExp(`^/ui${BASE}/(${ID})$`);
+const UI_LIST = /^\/ui\/(conversations|agents)(\/?)$/;
 
 /** `html` is only for the browser page; everything Rakazo calls stays JSON. */
 type Reply = { status: number; body: unknown; html?: string };
@@ -79,6 +80,12 @@ async function route(runner: ConversationRunner, request: IncomingMessage): Prom
     const transcript = await runner.transcript(ui[1]!);
     if (!transcript) return { status: 404, body: { code: "not_found" } };
     return { status: 200, body: null, html: transcriptPage(transcript, runner.list()) };
+  }
+  const uiList = UI_LIST.exec(pathname);
+  if (uiList && method === "GET") {
+    // Relative links: `/ui/conversations` needs `conversations/<id>`, `/ui/conversations/` needs `./<id>`.
+    const hrefPrefix = uiList[2] ? "./" : `${uiList[1]}/`;
+    return { status: 200, body: null, html: conversationsPage(runner.list(), hrefPrefix) };
   }
   return { status: 404, body: { code: "route_not_found" } };
 }

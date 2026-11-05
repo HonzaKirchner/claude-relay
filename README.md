@@ -83,4 +83,4 @@ Every `/conversations` path is also served under `/agents`, the name Rakazo uses
 | `POST /conversations/:id/runs` | `{ prompt, images? }`. Starts a follow-up; `409 busy` while a run is going. |
 | `POST /conversations/:id/runs/:runId/cancel` | Stops the run and returns once it has stopped. |
 
-Each returns `{ id, title, status, runId, branch?, prUrl?, error?, url? }` with `status` one of `running`, `finished`, `failed`, `cancelled`. `url` is present only when `APP_URL` is set and points to `GET /ui/conversations/:id`, an HTML page with the whole conversation (all runs) that reloads every 5 s while a run is going.
+Each returns `{ id, title, status, runId, branch?, prUrl?, error?, url? }` with `status` one of `running`, `finished`, `failed`, `cancelled`. `url` is present only when `APP_URL` is set and points to `GET /ui/conversations/:id`, an HTML page with the whole conversation (all runs) that reloads every 5 s while a run is going. Its left sidebar lists every conversation; `GET /ui/conversations` shows that list on its own.
