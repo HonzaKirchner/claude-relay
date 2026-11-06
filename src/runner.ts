@@ -83,6 +83,8 @@ export interface RunnerOptions {
   /** What new conversations branch from when the launch names no `baseBranch`; the origin's default branch when unset. */
   baseBranch?: string;
   claudeCommand: string;
+  /** Passed to `claude` as `--model`; Claude Code's own default when unset. */
+  claudeModel?: string;
   ghCommand: string;
   env?: NodeJS.ProcessEnv;
   /** The service's base URL as seen from a browser (through Coder's app proxy). */
@@ -732,6 +734,7 @@ export class ConversationRunner {
       "--dangerously-skip-permissions",
       "--append-system-prompt",
       note,
+      ...(this.options.claudeModel ? ["--model", this.options.claudeModel] : []),
       ...(conversation.sessionStarted ? ["--resume", conversation.sessionId] : ["--session-id", conversation.sessionId]),
     ];
     this.throwIfCancelled(conversation);

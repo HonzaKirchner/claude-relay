@@ -153,6 +153,7 @@ const identity = {
 interface StartOptions {
   publicUrl?: string;
   baseBranch?: string;
+  claudeModel?: string;
   root?: string;
 }
 
@@ -595,6 +596,18 @@ describe("claude code runner", () => {
     await call("PUT", "/conversations/main-2", { prompt: "On main", baseBranch: "main" });
     await runner.idle();
     expect(filesOn("agent/main-2")).not.toContain("RELEASE.md");
+  });
+
+  it("runs claude with the configured model", async () => {
+    await call("PUT", "/conversations/default-model", { prompt: "Add a file" });
+    await runner.idle();
+    expect(claudeCalls()[0]).not.toContain("--model");
+
+    await restart({ claudeModel: "opus" });
+    await call("POST", "/conversations/default-model/runs", { prompt: "And another" });
+    await runner.idle();
+    const [, reply] = claudeCalls();
+    expect(reply![reply!.indexOf("--model") + 1]).toBe("opus");
   });
 
   it("restores a conversation's branch from the origin when the checkout lost it", async () => {

@@ -18,6 +18,7 @@ const options = {
   root: path.resolve(process.env.RUNNER_WORKDIR || path.join(os.homedir(), "src")),
   baseBranch: process.env.RUNNER_BASE_BRANCH || undefined,
   claudeCommand: process.env.CLAUDE_COMMAND || "claude",
+  claudeModel: process.env.CLAUDE_MODEL || undefined,
   ghCommand: process.env.GH_COMMAND || "gh",
   // Base URL of this service in a browser, e.g. https://coder.example.com/@me/ws/apps/claude.
   // When set, every ConversationView carries `url`, a link to the conversation page.
@@ -27,6 +28,7 @@ log.info("starting", {
   root: options.root,
   baseBranch: options.baseBranch ?? "the origin's default branch",
   claude: options.claudeCommand,
+  model: options.claudeModel ?? "Claude Code's default",
   gh: options.ghCommand,
   appUrl: options.publicUrl ?? "unset (responses carry no url)",
   logLevel: process.env.LOG_LEVEL || "info",

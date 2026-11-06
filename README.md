@@ -23,6 +23,7 @@ Settings come from the environment, or from `.env` when started with `npm start`
 | `RUNNER_WORKDIR` | `~/src` | The directory holding the checkouts, one per repository and named after it: the last segment of the repository URL without `.git`. Each needs an `origin` remote the workspace can fetch from and push to, and it must be that repository. The directory can also be one checkout itself: launches that name its repository, or none, work in it. The service exits if the directory does not exist; whether a repository is checked out is checked per launch. |
 | `RUNNER_BASE_BRANCH` | the origin's default branch | What a new conversation's branch starts from, unless the launch names a `baseBranch`. |
 | `CLAUDE_COMMAND` | `claude` | |
+| `CLAUDE_MODEL` | Claude Code's default | The model every run uses, passed to `claude` as `--model`: an alias such as `opus` or `sonnet`, or a full model id. |
 | `GH_COMMAND` | `gh` | |
 | `APP_URL` | – | The service's base URL in a browser, e.g. `https://coder.example.com/@owner/workspace/apps/claude`. When set, responses include `url`, a link to the conversation page. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` or `silent`. At `info` the log shows one line per launch, follow-up, cancel, `claude` exit (turns, cost), push, PR and run end, plus every write request. `debug` adds the GET polls and each git/gh command. |
