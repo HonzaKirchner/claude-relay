@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import type { Server } from "node:http";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -360,7 +360,8 @@ describe("claude code runner", () => {
     // Its head names the service and links back to Rakazo.
     expect(html).toContain("Rakazo code");
     expect(html).toContain('href="https://rakazo.example.com/app"');
-    expect(html).toContain('href="./linked" class="current"');
+    // Open, and its branch is what the checkout is on.
+    expect(html).toContain('href="./linked" class="current checked-out"');
     expect(html).toContain("By model");
     expect(html).toContain("Opus 5.5");
     expect(html).toContain("$0.25");
@@ -513,7 +514,7 @@ describe("claude code runner", () => {
     expect((await call("GET", "/conversations/demo-1")).body.status).toBe("finished");
     expect(git(other, "log", "--format=%s", "-1").trim()).toBe("local");
     expect(git(checkout, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/demo-1");
-  });
+  }, 20_000); // Five runs and a few dozen git commands: about 6 s on a laptop.
 
   it("refuses a launch for a repository that is not checked out under the root", async () => {
     expect(await call("PUT", "/conversations/missing", { prompt: "hi", repository: "https://github.com/example/missing.git" })).toEqual({
@@ -633,11 +634,13 @@ describe("claude code runner", () => {
   });
 
   it("describes the workspace: the run going and each checkout's branch", async () => {
+    // The service's own checkout is not part of the platform, even when it lives under the root.
+    symlinkSync(process.cwd(), path.join(root, "claude-relay"));
     const idle = await (await fetch(`${base}/workspace`)).json();
     expect(idle).toEqual({
       checkouts: [
-        { name: "demo", path: checkout, repository: REPOSITORY, branch: "main", dirty: false },
-        { name: "other", path: other, repository: OTHER, branch: "main", dirty: false },
+        { name: "demo", path: checkout, repository: REPOSITORY, branch: "main", defaultBranch: "main", dirty: false },
+        { name: "other", path: other, repository: OTHER, branch: "main", defaultBranch: "main", dirty: false },
       ],
     });
     const launched = await call("PUT", "/conversations/busy", { prompt: "hang\nmore" });
@@ -645,15 +648,15 @@ describe("claude code runner", () => {
     expect(await (await fetch(`${base}/workspace`)).json()).toEqual({
       running: { conversation: "busy", title: "hang", runId: launched.body.runId, startedAt: expect.any(String), checkout },
       checkouts: [
-        { name: "demo", path: checkout, repository: REPOSITORY, branch: "agent/busy", dirty: false, conversation: "busy" },
-        { name: "other", path: other, repository: OTHER, branch: "main", dirty: false },
+        { name: "demo", path: checkout, repository: REPOSITORY, branch: "agent/busy", defaultBranch: "main", dirty: false, conversation: "busy" },
+        { name: "other", path: other, repository: OTHER, branch: "main", defaultBranch: "main", dirty: false },
       ],
     });
     await call("POST", `/conversations/busy/runs/${launched.body.runId}/cancel`);
     // The root itself when it is the checkout.
     await restart({ root: checkout });
     expect(await (await fetch(`${base}/workspace`)).json()).toEqual({
-      checkouts: [{ name: "demo", path: checkout, repository: REPOSITORY, branch: "agent/busy", dirty: false, conversation: "busy" }],
+      checkouts: [{ name: "demo", path: checkout, repository: REPOSITORY, branch: "agent/busy", defaultBranch: "main", dirty: false, conversation: "busy" }],
     });
   });
 
@@ -668,9 +671,11 @@ describe("claude code runner", () => {
     expect(html).toContain('data-mode="off"');
     expect(html).toContain('<textarea name="prompt" rows="1" maxlength="100000" placeholder="Not available right now" aria-label="Message to Claude" disabled>');
     expect(html).toContain('Claude is working on <a href="./first">hang</a>.');
-    expect(html).toContain('Working on <a href="./first">hang</a>');
+    // The workspace section's state links to the running conversation, and marks the checkout on its branch.
+    expect(html).toContain('<a class="ws-task" href="./first" title="hang">');
+    expect(html).toContain('<li class="checkout running" title="');
     // The list page shows the same workspace section.
-    expect(await (await fetch(`${base}/ui/conversations`)).text()).toContain('Working on <a href="conversations/first">hang</a>');
+    expect(await (await fetch(`${base}/ui/conversations`)).text()).toContain('<a class="ws-task" href="conversations/first" title="hang">');
     await call("POST", `/conversations/first/runs/${launched.body.runId}/cancel`);
     // The runner is idle: both pages offer a follow-up.
     for (const id of ["first", "second"]) {

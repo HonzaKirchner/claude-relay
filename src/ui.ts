@@ -1,4 +1,4 @@
-import type { ComposerState, ConversationSummary, RunMessage, Transcript, Workspace } from "./runner.ts";
+import type { Checkout, ComposerState, ConversationSummary, RunMessage, Transcript, Workspace } from "./runner.ts";
 
 type Block = Record<string, unknown>;
 
@@ -10,6 +10,8 @@ export interface PageOptions {
   consoleUrl?: string;
   /** A terminal in the workspace, for cleaning up a checkout by hand; see `terminalUrlOf`. Without it there is no link. */
   terminalUrl?: string;
+  /** VS Code on the workspace, for the same. Without it there is no link. */
+  vscodeUrl?: string;
 }
 
 /**
@@ -52,15 +54,17 @@ export function transcriptPage(
 <noscript>${running ? '<meta http-equiv="refresh" content="5">' : ""}</noscript>
 <title>${escape(transcript.title)}</title>
 <style>${STYLE}</style>
+<script>${WIDTH_SCRIPT}</script>
 </head>
 <body${live ? ` data-run="${escape(live.id)}" data-after="${live.events.length}" data-messages="${live.messages?.length ?? 0}"` : ""}>
 <input type="checkbox" id="toggle-nav" class="toggle" aria-label="Show conversations">
 <input type="checkbox" id="toggle-stats" class="toggle" aria-label="Show details">
 <div class="layout">
 <aside class="sidebar left" aria-label="Conversations">
+<div class="resizer" data-key="nav-width" title="Drag to resize, double-click to reset"></div>
 ${sidebarHead(options, `<label for="toggle-nav" class="close" title="Close">${ICONS.x}</label>`)}
 ${workspaceSection(workspace, conversations, "./", options)}
-<nav id="conversations">${conversationList(conversations, transcript.id)}</nav>
+<nav id="conversations">${conversationList(conversations, transcript.id, "./", checkedOut(workspace))}</nav>
 </aside>
 <div class="center">
 <main>
@@ -71,12 +75,14 @@ ${runs}
 ${composer(transcript, "./", options)}
 </div>
 <aside class="sidebar right" aria-label="Conversation details">
+<div class="resizer" data-key="stats-width" data-side="right" title="Drag to resize, double-click to reset"></div>
 <div class="sidebar-head"><span>Details</span><label for="toggle-stats" class="close" title="Close">${ICONS.x}</label></div>
 <div id="stats">${statsPanel(transcript)}</div>
 </aside>
 </div>
 <label for="toggle-nav" class="fab nav-button" title="Conversations">${ICONS.menu}</label><label for="toggle-stats" class="fab stats-button" title="Details">${ICONS.panel}</label>
 <label class="scrim" for="toggle-nav"></label><label class="scrim stats-scrim" for="toggle-stats"></label>
+<script>${SIDEBAR_SCRIPT}</script>
 <script>${STREAM_SCRIPT}</script>
 </body>
 </html>`;
@@ -102,18 +108,21 @@ export function conversationsPage(
 <noscript>${running ? '<meta http-equiv="refresh" content="5">' : ""}</noscript>
 <title>Rakazo code</title>
 <style>${STYLE}</style>
+<script>${WIDTH_SCRIPT}</script>
 </head>
 <body${running ? " data-running" : ""}>
 <div class="layout index">
 <aside class="sidebar left" aria-label="Conversations">
+<div class="resizer" data-key="nav-width" title="Drag to resize, double-click to reset"></div>
 ${sidebarHead(options)}
 ${workspaceSection(workspace, conversations, hrefPrefix, options)}
-<nav id="conversations">${conversationList(conversations, undefined, hrefPrefix)}</nav>
+<nav id="conversations">${conversationList(conversations, undefined, hrefPrefix, checkedOut(workspace))}</nav>
 </aside>
 <div class="center">
 <main><p class="empty">${conversations.length ? "Select a conversation." : "No conversations yet."}</p></main>
 </div>
 </div>
+<script>${SIDEBAR_SCRIPT}</script>
 ${running ? `<script>${POLL_SCRIPT}</script>` : ""}
 </body>
 </html>`;
@@ -128,36 +137,64 @@ function sidebarHead(options: PageOptions, close = ""): string {
 }
 
 /**
- * The top of the conversation sidebar: whether a run is going (and whose, for how long) or the
- * workspace is idle, links to its console and terminal, and each checkout under the root with
- * the branch it is on, the conversation that branch belongs to, and whether it has uncommitted
- * changes. The checkouts together are what the workspace builds and serves.
+ * The top of the conversation sidebar. First the state, on its own, always two lines: whether a
+ * run is going (for how long) or the workspace is idle, then a prominent link to the running
+ * conversation or "No task running"; with a button to its console and a menu for the terminal
+ * and VS Code (closed by a click elsewhere, see SIDEBAR_SCRIPT). Then the checkouts under the root that differ from the defaults:
+ * on a conversation's branch (linked), on some other branch, detached, or with uncommitted
+ * changes. Those on their default branch and clean are folded away, since they are the quiet
+ * default. The checkouts together are what the workspace builds and serves.
  */
 function workspaceSection(workspace: Workspace, conversations: ConversationSummary[], hrefPrefix: string, options: PageOptions): string {
   const titles = new Map(conversations.map((conversation) => [conversation.id, conversation.title]));
   const page = (id: string) => `${hrefPrefix}${encodeURIComponent(id)}`;
   const { running } = workspace;
-  const status = running
-    ? `<span class="dot running"></span><span class="ws-status">Working on <a href="${page(running.conversation)}">${escape(running.title)}</a></span><span class="elapsed" data-elapsed="${Math.max(0, Date.now() - Date.parse(running.startedAt))}">${timer(Math.max(0, Date.now() - Date.parse(running.startedAt)))}</span>`
-    : `<span class="dot idle"></span><span class="ws-status">Idle</span>`;
-  const tools = [
-    options.consoleUrl ? `<a class="tool-link" href="${escape(options.consoleUrl)}" target="_blank" rel="noopener">${ICONS.globe}Console</a>` : "",
-    options.terminalUrl ? `<a class="tool-link" href="${escape(options.terminalUrl)}" target="_blank" rel="noopener">${ICONS.terminal}Terminal</a>` : "",
+  const elapsed = running ? Math.max(0, Date.now() - Date.parse(running.startedAt)) : 0;
+  const state = running
+    ? `<div class="ws-state running"><div class="ws-state-line"><span class="dot running"></span><span class="ws-status">Working</span><span class="elapsed" data-elapsed="${elapsed}">${timer(elapsed)}</span></div><a class="ws-task" href="${page(running.conversation)}" title="${escape(running.title)}"><span class="spark">${ICONS.spark}</span><span>${escape(running.title)}</span>${ICONS.chevron}</a></div>`
+    : `<div class="ws-state idle"><div class="ws-state-line"><span class="dot idle"></span><span class="ws-status">Idle</span></div><div class="ws-task none">No task running</div></div>`;
+  const more = [
+    options.terminalUrl ? `<a href="${escape(options.terminalUrl)}" target="_blank" rel="noopener">${ICONS.terminal}<span>Terminal</span></a>` : "",
+    options.vscodeUrl ? `<a href="${escape(options.vscodeUrl)}" target="_blank" rel="noopener">${ICONS.code}<span>VS Code</span></a>` : "",
   ].join("");
-  const rows = workspace.checkouts
+  const tools =
+    (options.consoleUrl ? `<a class="ws-button primary" href="${escape(options.consoleUrl)}" target="_blank" rel="noopener">${ICONS.globe}<span>Open console</span></a>` : "") +
+    (more ? `<details class="ws-menu"><summary class="ws-button" title="Open in…" aria-label="Open in…">${ICONS.chevron}</summary><div class="ws-menu-list">${more}</div></details>` : "");
+  // The checkout the run works in counts as changed even while the scan predates the switch to its branch.
+  const active = (checkout: Checkout) => isChanged(checkout) || running?.checkout === checkout.path;
+  const changed = workspace.checkouts.filter(active);
+  const quiet = workspace.checkouts.filter((checkout) => !active(checkout));
+  const rows = changed
     .map((checkout) => {
       const title = checkout.conversation ? titles.get(checkout.conversation) : undefined;
       const state = running?.checkout === checkout.path ? "running" : checkout.dirty ? "dirty" : "";
       const branch = checkout.branch ? `<code>${escape(checkout.branch)}</code>` : '<span class="hint">detached</span>';
-      const owner = checkout.conversation && title ? ` · <a href="${page(checkout.conversation)}" title="${escape(title)}">${escape(title)}</a>` : "";
-      return `<li class="checkout${state ? ` ${state}` : ""}" title="${escape(checkout.path)}"><span class="checkout-name">${ICONS.repo}${link(checkout.repository, checkout.name)}${checkout.dirty ? '<span class="flag">uncommitted changes</span>' : ""}</span><span class="checkout-branch">${ICONS.branch}<span>${branch}${owner}</span></span></li>`;
+      const task = checkout.conversation && title ? `<a class="checkout-task" href="${page(checkout.conversation)}" title="${escape(title)}">${ICONS.pr}<span>${escape(title)}</span></a>` : "";
+      return `<li class="checkout${state ? ` ${state}` : ""}" title="${escape(checkout.path)}"><span class="checkout-name">${ICONS.repo}${link(checkout.repository, checkout.name)}${state === "running" ? '<span class="flag live">running</span>' : checkout.dirty ? '<span class="flag">uncommitted changes</span>' : ""}</span><span class="checkout-branch">${ICONS.branch}${branch}</span>${task}</li>`;
     })
     .join("");
+  const others = quiet
+    .map((checkout) => `<li class="checkout" title="${escape(checkout.path)}"><span class="checkout-name">${ICONS.repo}${link(checkout.repository, checkout.name)}</span><span class="checkout-branch"><code>${escape(checkout.branch)}</code></span></li>`)
+    .join("");
+  const folded = quiet.length
+    ? `<details class="ws-others" id="ws-others"><summary>${ICONS.chevron}<span>${changed.length ? `${quiet.length} more` : `All ${quiet.length}`} on the default branch</span></summary><ul class="checkouts quiet">${others}</ul></details>`
+    : "";
   return `<section id="workspace" class="workspace" aria-label="Workspace">
-<div class="ws-head">${status}</div>
+${state}
 ${tools ? `<div class="ws-tools">${tools}</div>` : ""}
-${rows ? `<ul class="checkouts">${rows}</ul>` : '<p class="empty">No checkouts under the root.</p>'}
+${workspace.checkouts.length ? `<div class="ws-checkouts">${rows ? `<ul class="checkouts">${rows}</ul>` : ""}${folded}</div>` : '<p class="empty">No checkouts under the root.</p>'}
 </section>`;
+}
+
+/** Whether a checkout differs from the quiet default: clean on its default branch. */
+function isChanged(checkout: Checkout): boolean {
+  if (checkout.dirty || !checkout.branch || checkout.conversation) return true;
+  return checkout.defaultBranch !== undefined && checkout.branch !== checkout.defaultBranch;
+}
+
+/** The conversations whose branch a checkout is on: what the workspace serves right now. */
+function checkedOut(workspace: Workspace): Set<string> {
+  return new Set(workspace.checkouts.flatMap((checkout) => (checkout.conversation ? [checkout.conversation] : [])));
 }
 
 /**
@@ -194,12 +231,13 @@ function composerHint(state: ComposerState, transcript: Transcript, hrefPrefix: 
   }
 }
 
-function conversationList(conversations: ConversationSummary[], currentId?: string, hrefPrefix = "./"): string {
+function conversationList(conversations: ConversationSummary[], currentId?: string, hrefPrefix = "./", checkedOut = new Set<string>()): string {
   if (!conversations.length) return '<p class="empty">No conversations yet.</p>';
   const now = Date.now();
   return `<ul class="conversations">${conversations
     .map((conversation) => {
       const current = conversation.id === currentId;
+      const marked = [current ? "current" : "", checkedOut.has(conversation.id) ? "checked-out" : ""].filter(Boolean).join(" ");
       const meta = [
         relativeTime(conversation.updatedAt, now),
         `${conversation.runCount} run${conversation.runCount === 1 ? "" : "s"}`,
@@ -207,7 +245,9 @@ function conversationList(conversations: ConversationSummary[], currentId?: stri
       ].filter(Boolean);
       // A finished conversation is the quiet default; anything else is named next to the dot's colour.
       const label = conversation.status === "finished" ? "" : `<span class="status ${conversation.status}">${escape(capitalize(conversation.status))}</span> · `;
-      return `<li><a href="${hrefPrefix}${encodeURIComponent(conversation.id)}"${current ? ' class="current" aria-current="page"' : ""}><span class="dot ${conversation.status}" title="${conversation.status}"></span><span class="conv-text"><span class="conv-title">${escape(conversation.title)}</span><span class="conv-meta">${label}${escape(meta.join(" · "))}</span></span></a></li>`;
+      // The conversation whose branch a checkout is on is what the workspace serves: marked in the list.
+      const badge = checkedOut.has(conversation.id) ? `<span class="badge" title="Its branch is checked out">${ICONS.branch}checked out</span> · ` : "";
+      return `<li><a href="${hrefPrefix}${encodeURIComponent(conversation.id)}"${marked ? ` class="${marked}"` : ""}${current ? ' aria-current="page"' : ""}><span class="dot ${conversation.status}" title="${conversation.status}"></span><span class="conv-text"><span class="conv-title">${escape(conversation.title)}</span><span class="conv-meta">${badge}${label}${escape(meta.join(" · "))}</span></span></a></li>`;
     })
     .join("")}</ul>`;
 }
@@ -230,11 +270,10 @@ interface Stats {
   models: Map<string, ModelUsage>;
   tools: Map<string, number>;
   files: Set<string>;
-  runs: Array<{ id: string; seq: number; status: string; cost?: number; ms?: number }>;
 }
 
 function computeStats(transcript: Transcript): Stats {
-  const stats: Stats = { cost: 0, unpriced: 0, apiMs: 0, wallMs: 0, turns: 0, models: new Map(), tools: new Map(), files: new Set(), runs: [] };
+  const stats: Stats = { cost: 0, unpriced: 0, apiMs: 0, wallMs: 0, turns: 0, models: new Map(), tools: new Map(), files: new Set() };
   const model = (name: string) => {
     let usage = stats.models.get(name);
     if (!usage) stats.models.set(name, (usage = { cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }));
@@ -293,7 +332,6 @@ function computeStats(transcript: Transcript): Stats {
     if (ms !== undefined) stats.wallMs += ms;
     if (cost === undefined) stats.unpriced++;
     else stats.cost += cost;
-    stats.runs.push({ id: run.id, seq: run.seq, status: run.status, ...(cost !== undefined ? { cost } : {}), ...(ms !== undefined ? { ms } : {}) });
   }
   return stats;
 }
@@ -349,13 +387,6 @@ function statsPanel(transcript: Transcript): string {
   ${stats.unpriced ? `<div class="hint">${stats.unpriced} run${stats.unpriced === 1 ? "" : "s"} ${status === "running" && stats.unpriced === 1 ? "still going, not counted yet" : "without a reported cost"}</div>` : ""}
   ${models.length ? `<div class="sub-title">By model</div><ul class="models">${modelRows}</ul>` : '<div class="hint">No usage reported yet.</div>'}
   ${models.length ? `<dl class="facts tokens"><dt>Input tokens</dt><dd>${tokenCount(tokens.input)}</dd><dt>Output tokens</dt><dd>${tokenCount(tokens.output)}</dd><dt>Cache read</dt><dd>${tokenCount(tokens.cacheRead)}</dd><dt>Cache write</dt><dd>${tokenCount(tokens.cacheWrite)}</dd></dl>` : ""}
-</section>`);
-
-  sections.push(`<section class="panel">
-  <div class="panel-title">Runs</div>
-  <ol class="run-list">${stats.runs
-    .map((run) => `<li><a href="#run-${escape(run.id)}"><span class="dot ${run.status}"></span><span>Run ${run.seq}</span><span class="run-meta">${[run.ms !== undefined ? duration(run.ms) : "", run.cost !== undefined ? money(run.cost) : ""].filter(Boolean).join(" · ")}</span></a></li>`)
-    .join("")}</ol>
 </section>`);
 
   const tools = [...stats.tools.entries()].sort((a, b) => b[1] - a[1]);
@@ -657,7 +688,7 @@ export function sidePanels(transcript: Transcript, conversations: ConversationSu
   return [
     { op: "replace", id: "stats", html: `<div id="stats">${statsPanel(transcript)}</div>` },
     { op: "replace", id: "workspace", html: workspaceSection(workspace, conversations, "./", options) },
-    { op: "replace", id: "conversations", html: `<nav id="conversations">${conversationList(conversations, transcript.id)}</nav>` },
+    { op: "replace", id: "conversations", html: `<nav id="conversations">${conversationList(conversations, transcript.id, "./", checkedOut(workspace))}</nav>` },
   ];
 }
 
@@ -1041,12 +1072,75 @@ const ICONS = {
   circle: svg('<circle cx="12" cy="12" r="8"/>'),
   halfCircle: svg('<circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor"/>'),
   menu: svg('<path d="M4 7h16M4 12h16M4 17h16"/>'),
+  code: svg('<path d="m8 8-4 4 4 4M16 8l4 4-4 4M14 5l-4 14"/>'),
   arrowLeft: svg('<path d="M19 12H5M11 6l-6 6 6 6"/>'),
   panel: svg('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/>'),
   x: svg('<path d="M6 6l12 12M18 6 6 18"/>'),
   send: svg('<path d="M12 19V5M6 11l6-6 6 6"/>'),
   checkCircle: svg('<circle cx="12" cy="12" r="8"/><path d="m8.5 12 2.5 2.5 4.5-5"/>'),
 };
+
+/** Applies the sidebar widths the browser remembers before the page first paints, so they do not jump. */
+const WIDTH_SCRIPT = `
+try {
+  for (const key of ["nav-width", "stats-width"]) {
+    const width = localStorage.getItem(key);
+    if (width) document.documentElement.style.setProperty("--" + key, width + "px");
+  }
+} catch {}
+`;
+
+/**
+ * Dragging a sidebar's edge resizes it (\`--nav-width\` and \`--stats-width\`, which the
+ * layout's grid uses), within limits; the widths are remembered in the browser. A double-click
+ * restores the default. Only in the wide layouts: narrower, a sidebar is an overlay of a fixed
+ * width. Also closes the workspace section's menu on a click elsewhere.
+ */
+const SIDEBAR_SCRIPT = `
+(() => {
+  const style = document.documentElement.style;
+  const clamp = (width) => Math.min(640, Math.max(240, Math.round(width)));
+  const remember = (key, width) => {
+    try {
+      if (width === undefined) localStorage.removeItem(key);
+      else localStorage.setItem(key, String(width));
+    } catch {}
+  };
+  for (const handle of document.querySelectorAll(".resizer")) {
+    const key = handle.dataset.key;
+    const measure = handle.dataset.side === "right" ? (event) => innerWidth - event.clientX : (event) => event.clientX;
+    handle.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      handle.setPointerCapture(event.pointerId);
+      handle.classList.add("dragging");
+      document.body.classList.add("resizing");
+      let width;
+      const move = (event) => {
+        width = clamp(measure(event));
+        style.setProperty("--" + key, width + "px");
+      };
+      const stop = () => {
+        handle.removeEventListener("pointermove", move);
+        handle.classList.remove("dragging");
+        document.body.classList.remove("resizing");
+        if (width !== undefined) remember(key, width);
+      };
+      handle.addEventListener("pointermove", move);
+      handle.addEventListener("pointerup", stop, { once: true });
+      handle.addEventListener("pointercancel", stop, { once: true });
+    });
+    handle.addEventListener("dblclick", () => {
+      style.removeProperty("--" + key);
+      remember(key, undefined);
+    });
+  }
+  // The workspace section is swapped in afresh on reloads, so the menu is watched from the document.
+  document.addEventListener("click", (event) => {
+    for (const menu of document.querySelectorAll(".ws-menu[open]")) if (!menu.contains(event.target)) menu.open = false;
+  });
+})();
+`;
 
 /** The conversation list page: fetches itself again while a run is going and swaps the list in. */
 const POLL_SCRIPT = `
@@ -1060,10 +1154,12 @@ const POLL_SCRIPT = `
     } catch {
       return setTimeout(tick, 5000);
     }
+    const open = [...document.querySelectorAll("details[open][id]")].map((d) => d.id);
     for (const id of ["workspace", "conversations"]) {
       const next = doc.getElementById(id);
       if (next) document.getElementById(id)?.replaceWith(next);
     }
+    for (const id of open) document.getElementById(id)?.setAttribute("open", "");
     if (doc.body.hasAttribute("data-running")) setTimeout(tick, 2000);
   }
   setTimeout(tick, 2000);
@@ -1264,18 +1360,26 @@ const STYLE = `
     }
   }
   * { box-sizing: border-box; }
-  html { background: var(--bg); }
+  /* The gutter stays reserved, so the page's width does not jump when a scrollbar appears. */
+  html { background: var(--bg); scrollbar-gutter: stable; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.6 var(--sans); -webkit-font-smoothing: antialiased; }
   a { color: var(--link); text-decoration: none; } a:hover { text-decoration: underline; }
   .icon { width: 16px; height: 16px; flex: none; }
   .muted { color: var(--muted); } .small { font-size: 13px; }
 
-  .layout { display: grid; grid-template-columns: 320px minmax(0, 1fr) 360px; min-height: 100vh; }
-  .layout.index { grid-template-columns: 320px minmax(0, 1fr); }
+  /* The sidebars' widths: dragged by their edges, see SIDEBAR_SCRIPT. */
+  :root { --nav-width: 320px; --stats-width: 360px; }
+  .layout { display: grid; grid-template-columns: var(--nav-width) minmax(0, 1fr) var(--stats-width); min-height: 100vh; }
+  .layout.index { grid-template-columns: var(--nav-width) minmax(0, 1fr); }
   .center { min-width: 0; display: flex; flex-direction: column; min-height: 100vh; }
   .toggle { position: absolute; opacity: 0; pointer-events: none; }
   .sidebar { position: sticky; top: 0; height: 100vh; overflow-y: auto; background: var(--sidebar); font-size: 14px; display: flex; flex-direction: column; }
   .sidebar.left { border-right: 1px solid var(--border); }
+  /* Inside the edge: the sidebar clips what overflows it. */
+  .resizer { position: absolute; top: 0; right: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 2; }
+  .sidebar.right .resizer { right: auto; left: 0; }
+  .resizer:hover, .resizer.dragging { background: var(--accent-soft); }
+  body.resizing { cursor: col-resize; user-select: none; }
   .sidebar.right { border-left: 1px solid var(--border); }
   .sidebar-head { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; gap: 8px; padding: 14px 16px 10px; font-weight: 600; background: var(--sidebar); }
   .sidebar-head .close { margin-left: auto; display: none; cursor: pointer; color: var(--muted); }
@@ -1289,6 +1393,9 @@ const STYLE = `
   .conversations a { display: flex; gap: 10px; align-items: flex-start; padding: 7px 10px; border-radius: 8px; color: var(--text-2); }
   .conversations a:hover { background: var(--hover); text-decoration: none; }
   .conversations a.current { background: var(--selected); color: var(--text); }
+  /* Sized to the text, so the badge does not make its line taller than the others. */
+  .conv-meta .badge { display: inline-flex; align-items: center; gap: 3px; line-height: 1; vertical-align: -1px; color: var(--accent); font-weight: 600; }
+  .conv-meta .badge .icon { width: 11px; height: 11px; }
   .conversations .dot { margin-top: 6px; }
   .conv-meta .status { font-weight: 600; }
   .conv-text { display: flex; flex-direction: column; min-width: 0; }
@@ -1319,10 +1426,6 @@ const STYLE = `
   .meter, .bar-track { display: block; height: 6px; border-radius: 999px; background: var(--hover); overflow: hidden; margin: 5px 0 4px; }
   .meter span, .bar-track span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
   .model-tokens { font-size: 12px; color: var(--muted); }
-  .run-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
-  .run-list a { display: flex; align-items: center; gap: 8px; padding: 4px 6px; margin: 0 -6px; border-radius: 6px; color: var(--text-2); }
-  .run-list a:hover { background: var(--hover); text-decoration: none; }
-  .run-meta { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
   .bars { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
   .bars li { display: grid; grid-template-columns: minmax(0, 1fr) 70px 2.5em; align-items: center; gap: 8px; }
   .bars .bar-track { margin: 0; }
@@ -1345,8 +1448,9 @@ const STYLE = `
   .links .hint { flex: none; }
   .scrim { display: none; }
   @media (max-width: 1380px) {
-    .layout { grid-template-columns: 320px minmax(0, 1fr); }
+    .layout { grid-template-columns: var(--nav-width) minmax(0, 1fr); }
     .sidebar.right { position: fixed; right: 0; top: 0; width: min(380px, 92vw); z-index: 10; transform: translateX(100%); transition: transform .2s ease; box-shadow: var(--shadow); }
+    .sidebar.right .resizer { display: none; }
     #toggle-stats:checked ~ .layout .sidebar.right { transform: none; }
     #toggle-stats:checked ~ .stats-scrim { display: block; }
     .stats-button, .sidebar.right .close { display: inline-flex; }
@@ -1354,6 +1458,7 @@ const STYLE = `
   @media (max-width: 1000px) {
     .layout { grid-template-columns: minmax(0, 1fr); }
     .sidebar.left { position: fixed; left: 0; top: 0; width: min(340px, 92vw); z-index: 10; transform: translateX(-100%); transition: transform .2s ease; box-shadow: var(--shadow); }
+    .sidebar.left .resizer { display: none; }
     #toggle-nav:checked ~ .layout .sidebar.left { transform: none; }
     #toggle-nav:checked ~ .scrim:not(.stats-scrim) { display: block; }
     .nav-button, .sidebar.left .close { display: inline-flex; }
@@ -1453,7 +1558,9 @@ const STYLE = `
   .steer-note { font-size: 12px; color: var(--muted); }
 
   /* Always shown: steers the running run, starts a follow-up, or says why neither is possible. */
-  .composer { position: sticky; bottom: 0; z-index: 2; max-width: 768px; margin: 0 auto; padding: 0 16px 16px; background: linear-gradient(transparent, var(--bg) 24px); }
+  /* Solid and a little wider than the transcript, so nothing shows below or beside it. Full width: as a
+     flex item with auto margins it would otherwise be as wide as its hint text. */
+  .composer { position: sticky; bottom: 0; z-index: 2; width: 100%; max-width: 800px; margin: 0 auto; padding: 8px 16px 16px; background: var(--bg); }
   .composer-box { display: flex; align-items: flex-end; gap: 8px; background: var(--surface); border: 1px solid var(--border-strong); border-radius: 16px; padding: 8px 8px 8px 14px; box-shadow: 0 4px 20px rgba(0, 0, 0, .08); }
   .composer-box:focus-within { border-color: var(--accent); }
   .composer[data-mode="off"] .composer-box { opacity: .55; box-shadow: none; }
@@ -1466,24 +1573,56 @@ const STYLE = `
   .composer-hint.error { color: var(--err); }
   .composer-hint code { font: 11.5px var(--mono); }
 
-  .workspace { margin: 0 8px 10px; padding: 10px 10px 6px; border-bottom: 1px solid var(--border); }
-  .ws-head { display: flex; align-items: center; gap: 8px; font-weight: 600; min-width: 0; }
+  .workspace { margin: 0 8px 10px; padding: 0 4px 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
+  /* The state stands apart from the checkouts: a card of its own. */
+  .ws-state { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 9px 12px; display: flex; flex-direction: column; gap: 8px; }
+  /* Running: the border and the word in the run colour, no tinted background. */
+  .ws-state.running { border-color: var(--run); } .ws-state.running .ws-status { color: var(--run); }
+  /* Both lines have fixed heights, so the card is the same size idle and running. */
+  .ws-state-line { display: flex; align-items: center; gap: 8px; height: 22px; font-weight: 600; min-width: 0; }
   .ws-status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-  .ws-head .elapsed { margin-left: auto; flex: none; font-weight: 500; font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .ws-tools { display: flex; gap: 12px; margin: 6px 0 2px 18px; font-size: 13px; }
-  .tool-link { display: inline-flex; align-items: center; gap: 4px; color: var(--text-2); }
-  .tool-link .icon { width: 14px; height: 14px; color: var(--muted); }
-  .checkouts { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
-  .checkout { display: flex; flex-direction: column; gap: 1px; padding: 4px 6px; margin: 0 -6px; border-radius: 6px; min-width: 0; }
-  .checkout.running { background: var(--run-soft); }
-  .checkout-name, .checkout-branch { display: flex; align-items: center; gap: 6px; min-width: 0; }
-  .checkout-name { font-weight: 500; }
+  .ws-state-line .elapsed { margin-left: auto; flex: none; font-weight: 500; font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .ws-task { display: flex; align-items: center; gap: 6px; height: 34px; padding: 0 8px; margin: 0 -4px -1px; border-radius: 8px; background: var(--accent-soft); color: var(--text); font-weight: 500; min-width: 0; }
+  .ws-task:hover { text-decoration: none; background: color-mix(in srgb, var(--accent) 24%, transparent); }
+  .ws-task > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Idle: the same line, so the card keeps its height. */
+  .ws-task.none { background: none; color: var(--muted); font-weight: 400; }
+  .ws-task .spark { width: 14px; height: 14px; } .ws-task .chevron { margin-left: auto; color: var(--muted); }
+  .ws-tools { display: flex; gap: 8px; }
+  .ws-button { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border-strong); background: var(--surface); color: var(--text-2); font-size: 13px; font-weight: 500; white-space: nowrap; }
+  .ws-button:hover { text-decoration: none; color: var(--text); border-color: var(--muted); }
+  .ws-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .ws-button.primary:hover { color: #fff; border-color: var(--accent); background: color-mix(in srgb, var(--accent) 86%, #000); }
+  .ws-button .icon { width: 14px; height: 14px; }
+  .ws-menu { position: relative; flex: none; display: flex; }
+  .ws-menu > summary { flex: none; padding: 6px 7px; }
+  .ws-menu > summary .chevron { transform: rotate(90deg); color: inherit; }
+  .ws-menu[open] > summary .chevron { transform: rotate(-90deg); }
+  .ws-menu-list { position: absolute; right: 0; top: calc(100% + 4px); z-index: 3; min-width: 160px; display: flex; flex-direction: column; padding: 4px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); }
+  .ws-menu-list a { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 6px; color: var(--text-2); font-size: 13px; white-space: nowrap; }
+  .ws-menu-list a:hover { background: var(--hover); color: var(--text); text-decoration: none; }
+  .ws-menu-list .icon { width: 14px; height: 14px; color: var(--muted); }
+  .ws-checkouts { display: flex; flex-direction: column; gap: 4px; padding: 0 2px; }
+  .checkouts { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+  .checkout { display: flex; flex-direction: column; gap: 2px; padding: 4px 6px; margin: 0 -6px; border-radius: 6px; min-width: 0; }
+  .checkout-name, .checkout-branch, .checkout-task { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .checkout-name { font-weight: 600; }
   .checkout-name a { color: var(--text); }
   .checkout-branch { color: var(--muted); font-size: 12.5px; }
-  .checkout-branch > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .checkout-branch code { font: 12px var(--mono); }
+  .checkout-branch code { font: 12px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .checkout-task { color: var(--link); font-weight: 500; }
+  .checkout-task > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .checkout-task .icon { color: var(--link); }
   .checkout .icon { width: 13px; height: 13px; color: var(--muted); }
   .checkout .flag { margin-left: auto; flex: none; font-size: 11.5px; font-weight: 600; color: var(--err); }
+  .checkout .flag.live { color: var(--run); }
+  /* The checkouts on their default branch, folded away. */
+  .ws-others > summary { display: flex; align-items: center; gap: 4px; font-size: 12.5px; color: var(--muted); padding: 2px 0; }
+  .ws-others > summary:hover { color: var(--text-2); }
+  .ws-others .checkouts { margin: 4px 0 0 4px; gap: 2px; }
+  .checkouts.quiet .checkout { flex-direction: row; align-items: center; gap: 8px; padding: 2px 6px; }
+  .checkouts.quiet .checkout-name { font-weight: 500; flex: none; }
+  .checkouts.quiet .checkout-branch { min-width: 0; }
   .dot.idle { background: var(--muted); opacity: .5; }
   .working { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 14px; color: var(--muted); min-width: 0; }
   .activity-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }

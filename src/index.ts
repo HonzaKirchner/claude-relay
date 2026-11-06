@@ -27,11 +27,12 @@ const options = {
 };
 // Where the pages' links go: the Rakazo app the conversations are launched from, the console
 // the workspace serves from its checkouts, and the workspace's terminal (Coder's, derived from
-// APP_URL) for cleaning up a checkout by hand.
+// APP_URL unless TERMINAL_URL says otherwise) and VS Code for cleaning up a checkout by hand.
 const pages = {
   rakazoUrl: process.env.RAKAZO_URL || "https://rakazo.jankirchner.cz/app",
   consoleUrl: process.env.CONSOLE_URL || undefined,
-  terminalUrl: terminalUrlOf(options.publicUrl),
+  terminalUrl: process.env.TERMINAL_URL || terminalUrlOf(options.publicUrl),
+  vscodeUrl: process.env.VSCODE_URL || undefined,
 };
 log.info("starting", {
   root: options.root,
@@ -43,6 +44,7 @@ log.info("starting", {
   rakazoUrl: pages.rakazoUrl,
   consoleUrl: pages.consoleUrl ?? "unset (no console link)",
   terminalUrl: pages.terminalUrl ?? "unset (no terminal link)",
+  vscodeUrl: pages.vscodeUrl ?? "unset (no VS Code link)",
   logLevel: process.env.LOG_LEVEL || "info",
 });
 

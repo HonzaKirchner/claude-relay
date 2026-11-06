@@ -2,7 +2,7 @@ import type { ChildProcess } from "node:child_process";
 import type { Writable } from "node:stream";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readdir, stat } from "node:fs/promises";
+import { readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import type { ClaudeEvent, Conversation, Run, RunMessage, RunStatus, Store, StoredEvent } from "./db.ts";
 import { log, since } from "./log.ts";
@@ -95,6 +95,8 @@ export interface Checkout {
   repository: string;
   /** The branch it is on; empty when HEAD is detached. */
   branch: string;
+  /** Its origin's default branch (`origin/HEAD`), when the clone recorded it or a run has learned it. */
+  defaultBranch?: string;
   /** Has uncommitted changes. */
   dirty: boolean;
   /** The conversation whose branch it is on, when it is on one. */
@@ -238,6 +240,13 @@ const MAX_ERROR = 500;
 const SUMMARY_MAX = 20_000;
 /** How long a scan of the checkouts (branch, uncommitted changes) serves the pages before a new one. */
 const WORKSPACE_TTL_MS = 3_000;
+
+/**
+ * The checkout this service runs from, resolved once: left out of the workspace, since it is
+ * the service and not part of the platform the checkouts build (it may well live under the root,
+ * `~/src/claude-relay`). A run must not switch it, and its own changes must not block runs.
+ */
+const OWN_CHECKOUT = realpath(path.resolve(import.meta.dirname, "..")).catch(() => undefined);
 
 /**
  * Runs one headless Claude Code session per conversation, in the checkout of the conversation's
@@ -434,24 +443,46 @@ export class ConversationRunner {
     };
   }
 
-  /** Every git checkout under the root (and the root itself when it is one), freshly inspected. */
+  /**
+   * Every git checkout under the root (and the root itself when it is one), freshly inspected;
+   * all but the service's own (`OWN_CHECKOUT`).
+   */
   private async scan(): Promise<Checkout[]> {
     const { root } = this.options;
     const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
-    const names = entries.filter((entry) => entry.isDirectory() && !entry.name.startsWith(".")).map((entry) => entry.name).sort();
+    const names = entries.filter((entry) => !entry.name.startsWith(".")).map((entry) => entry.name).sort();
     const dirs = [root, ...names.map((name) => path.join(root, name))];
-    const found = await Promise.all(dirs.map((dir) => this.inspect(dir)));
+    const own = await OWN_CHECKOUT;
+    const found = await Promise.all(
+      dirs.map(async (dir) => {
+        const real = await realpath(dir).catch(() => undefined);
+        if (!real || !(await stat(real).then((s) => s.isDirectory(), () => false)) || real === own) return undefined;
+        return this.inspect(dir);
+      }),
+    );
     return found.filter((checkout): checkout is Checkout => checkout !== undefined);
   }
 
-  /** `dir` as a checkout, or undefined when it is none (or has no origin). */
+  /** `dir` as a checkout, or undefined when it is none (or has no origin). Reads only. */
   private async inspect(dir: string): Promise<Checkout | undefined> {
     if (!(await stat(path.join(dir, ".git")).then(() => true, () => false))) return undefined;
     const git = (args: string[]) => this.read(dir, args).catch(() => "");
     const origin = (await git(["config", "--get", "remote.origin.url"])).trim();
     if (!origin) return undefined;
-    const [branch, status] = await Promise.all([git(["branch", "--show-current"]), git(["status", "--porcelain"])]);
-    return { name: path.basename(dir), path: dir, repository: repositoryUrl(origin), branch: branch.trim(), dirty: Boolean(status.trim()) };
+    const [branch, status, head] = await Promise.all([
+      git(["branch", "--show-current"]),
+      git(["status", "--porcelain"]),
+      git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]),
+    ]);
+    const defaultBranch = head.trim().replace(/^origin\//, "") || this.defaults.get(dir);
+    return {
+      name: path.basename(dir),
+      path: dir,
+      repository: repositoryUrl(origin),
+      branch: branch.trim(),
+      ...(defaultBranch ? { defaultBranch } : {}),
+      dirty: Boolean(status.trim()),
+    };
   }
 
   /** Runs a read-only git command in `dir`, outside any run, so it is not a run's child and cancel does not reach it. */
