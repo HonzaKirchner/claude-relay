@@ -1,6 +1,12 @@
 import type { ConversationSummary, RunMessage, Transcript } from "./runner.ts";
 
 type Block = Record<string, unknown>;
+
+/** What the pages need besides their data. */
+export interface PageOptions {
+  /** Where the "Rakazo" link in the sidebar head goes: Rakazo's app, which the pages are opened from. Without it there is no link. */
+  rakazoUrl?: string;
+}
 type TranscriptRun = Transcript["runs"][number];
 
 /** Caps how much of a single tool result goes into the page. */
@@ -13,7 +19,7 @@ const MAX_OUTPUT = 20_000;
  * The page follows the conversation over `<page>/stream` (see `LiveRunRenderer`): new events are
  * appended as they come, and when a run starts or ends the page fetches itself and swaps in.
  */
-export function transcriptPage(transcript: Transcript, conversations: ConversationSummary[] = []): string {
+export function transcriptPage(transcript: Transcript, conversations: ConversationSummary[] = [], options: PageOptions = {}): string {
   const live = transcript.runs.find((run) => run.status === "running");
   const running = Boolean(live);
   const runs = transcript.runs.map((run) => renderRun(run)).join("\n");
@@ -31,7 +37,7 @@ export function transcriptPage(transcript: Transcript, conversations: Conversati
 <input type="checkbox" id="toggle-stats" class="toggle" aria-label="Show details">
 <div class="layout">
 <aside class="sidebar left" aria-label="Conversations">
-<div class="sidebar-head"><span class="spark">${ICONS.spark}</span><span>Conversations</span><label for="toggle-nav" class="close" title="Close">${ICONS.x}</label></div>
+${sidebarHead(options, `<label for="toggle-nav" class="close" title="Close">${ICONS.x}</label>`)}
 <nav id="conversations">${conversationList(conversations, transcript.id)}</nav>
 </aside>
 <div class="center">
@@ -62,7 +68,7 @@ ${runs}
  * open. `hrefPrefix` makes the links relative to the URL the page was served at, so they keep
  * working behind Coder's app proxy.
  */
-export function conversationsPage(conversations: ConversationSummary[], hrefPrefix: string): string {
+export function conversationsPage(conversations: ConversationSummary[], hrefPrefix: string, options: PageOptions = {}): string {
   const running = conversations.some((conversation) => conversation.status === "running");
   return `<!doctype html>
 <html lang="en">
@@ -70,13 +76,13 @@ export function conversationsPage(conversations: ConversationSummary[], hrefPref
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <noscript>${running ? '<meta http-equiv="refresh" content="5">' : ""}</noscript>
-<title>Conversations</title>
+<title>Rakazo code</title>
 <style>${STYLE}</style>
 </head>
 <body${running ? " data-running" : ""}>
 <div class="layout index">
 <aside class="sidebar left" aria-label="Conversations">
-<div class="sidebar-head"><span class="spark">${ICONS.spark}</span><span>Conversations</span></div>
+${sidebarHead(options)}
 <nav id="conversations">${conversationList(conversations, undefined, hrefPrefix)}</nav>
 </aside>
 <div class="center">
@@ -86,6 +92,14 @@ export function conversationsPage(conversations: ConversationSummary[], hrefPref
 ${running ? `<script>${POLL_SCRIPT}</script>` : ""}
 </body>
 </html>`;
+}
+
+/** The head of the conversation sidebar: the service's name and, when configured, the way back to Rakazo. */
+function sidebarHead(options: PageOptions, close = ""): string {
+  const back = options.rakazoUrl
+    ? `<a class="back" href="${escape(options.rakazoUrl)}" title="Back to Rakazo">${ICONS.arrowLeft}<span>Rakazo</span></a>`
+    : "";
+  return `<div class="sidebar-head"><span class="spark">${ICONS.spark}</span><span>Rakazo code</span>${back}${close}</div>`;
 }
 
 function conversationList(conversations: ConversationSummary[], currentId?: string, hrefPrefix = "./"): string {
@@ -934,6 +948,7 @@ const ICONS = {
   circle: svg('<circle cx="12" cy="12" r="8"/>'),
   halfCircle: svg('<circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor"/>'),
   menu: svg('<path d="M4 7h16M4 12h16M4 17h16"/>'),
+  arrowLeft: svg('<path d="M19 12H5M11 6l-6 6 6 6"/>'),
   panel: svg('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/>'),
   x: svg('<path d="M6 6l12 12M18 6 6 18"/>'),
   send: svg('<path d="M12 19V5M6 11l6-6 6 6"/>'),
@@ -1150,6 +1165,9 @@ const STYLE = `
   .sidebar.right { border-left: 1px solid var(--border); }
   .sidebar-head { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; gap: 8px; padding: 14px 16px 10px; font-weight: 600; background: var(--sidebar); }
   .sidebar-head .close { margin-left: auto; display: none; cursor: pointer; color: var(--muted); }
+  .sidebar-head .back { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 500; color: var(--muted); }
+  .sidebar-head .back:hover { color: var(--text); text-decoration: none; }
+  .sidebar-head .back + .close { margin-left: 0; }
   .empty, .hint { color: var(--muted); font-size: 13px; }
   .empty { padding: 0 16px; }
 

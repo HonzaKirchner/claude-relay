@@ -24,6 +24,8 @@ const options = {
   // When set, every ConversationView carries `url`, a link to the conversation page.
   publicUrl: process.env.APP_URL || undefined,
 };
+// Where the pages' "Rakazo" link goes: the Rakazo app the conversations are launched from.
+const rakazoUrl = process.env.RAKAZO_URL || "https://rakazo.jankirchner.cz/app";
 log.info("starting", {
   root: options.root,
   baseBranch: options.baseBranch ?? "the origin's default branch",
@@ -31,6 +33,7 @@ log.info("starting", {
   model: options.claudeModel ?? "Claude Code's default",
   gh: options.ghCommand,
   appUrl: options.publicUrl ?? "unset (responses carry no url)",
+  rakazoUrl,
   logLevel: process.env.LOG_LEVEL || "info",
 });
 
@@ -56,7 +59,7 @@ try {
 }
 
 const port = Number(process.env.PORT || 4115);
-const server = createServer(createHandler(runner)).listen(port, "127.0.0.1", () => {
+const server = createServer(createHandler(runner, { rakazoUrl })).listen(port, "127.0.0.1", () => {
   log.info(`claude-code-runner listening on 127.0.0.1:${port}`);
 });
 

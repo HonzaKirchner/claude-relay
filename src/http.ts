@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ConversationView, ConversationRunner, Image, LaunchRequest, PromptRequest, RunMessage } from "./runner.ts";
 import { log, since } from "./log.ts";
 import { CheckoutDirty, CheckoutMissing, ConversationBusy, RunNotRunning, checkoutName } from "./runner.ts";
-import type { LiveOp } from "./ui.ts";
+import type { LiveOp, PageOptions } from "./ui.ts";
 import { LiveRunRenderer, conversationsPage, sidePanels, transcriptPage } from "./ui.ts";
 
 const MAX_BODY_BYTES = 128 * 1024 * 1024;
@@ -31,7 +31,7 @@ const STREAM_PING_MS = 15_000;
 type Reply = { status: number; body: unknown; html?: string };
 
 /** JSON API over the runner. Listens on loopback only; Coder's app proxy authenticates callers. */
-export function createHandler(runner: ConversationRunner) {
+export function createHandler(runner: ConversationRunner, pages: PageOptions = {}) {
   return (request: IncomingMessage, response: ServerResponse) => {
     const started = performance.now();
     const live = UI_STREAM.exec(new URL(request.url ?? "/", "http://runner").pathname);
@@ -40,7 +40,7 @@ export function createHandler(runner: ConversationRunner) {
       logRequest(request, response.statusCode, since(started));
       return;
     }
-    route(runner, request)
+    route(runner, pages, request)
       .catch((error: unknown): Reply => {
         // One run at a time per checkout. `busy` is the code Rakazo knows; `reason` and the rest are
         // additive: `locked` names the conversation whose run is going, `dirty` the branch the
@@ -93,7 +93,7 @@ function logRequest(request: IncomingMessage, status: number, ms: number) {
   else log.info("request", fields);
 }
 
-async function route(runner: ConversationRunner, request: IncomingMessage): Promise<Reply> {
+async function route(runner: ConversationRunner, pages: PageOptions, request: IncomingMessage): Promise<Reply> {
   const url = new URL(request.url ?? "/", "http://runner");
   const pathname = url.pathname;
   const method = request.method ?? "GET";
@@ -118,13 +118,13 @@ async function route(runner: ConversationRunner, request: IncomingMessage): Prom
   if (ui && method === "GET") {
     const transcript = await runner.transcript(ui[1]!);
     if (!transcript) return { status: 404, body: { code: "not_found" } };
-    return { status: 200, body: null, html: transcriptPage(transcript, runner.list()) };
+    return { status: 200, body: null, html: transcriptPage(transcript, runner.list(), pages) };
   }
   const uiList = UI_LIST.exec(pathname);
   if (uiList && method === "GET") {
     // Relative links: `/ui/conversations` needs `conversations/<id>`, `/ui/conversations/` needs `./<id>`.
     const hrefPrefix = uiList[2] ? "./" : `${uiList[1]}/`;
-    return { status: 200, body: null, html: conversationsPage(runner.list(), hrefPrefix) };
+    return { status: 200, body: null, html: conversationsPage(runner.list(), hrefPrefix, pages) };
   }
   return { status: 404, body: { code: "route_not_found" } };
 }

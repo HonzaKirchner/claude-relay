@@ -181,7 +181,7 @@ async function start(options: StartOptions = {}) {
     },
   });
   await runner.load();
-  server = createServer(createHandler(runner));
+  server = createServer(createHandler(runner, { rakazoUrl: "https://rakazo.example.com/app" }));
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
@@ -342,6 +342,9 @@ describe("claude code runner", () => {
     expect(html).toContain("finished");
     // The left sidebar lists every conversation, the right one sums this one up.
     expect(html).toContain('href="./plain"');
+    // Its head names the service and links back to Rakazo.
+    expect(html).toContain("Rakazo code");
+    expect(html).toContain('href="https://rakazo.example.com/app"');
     expect(html).toContain('href="./linked" class="current"');
     expect(html).toContain("By model");
     expect(html).toContain("Opus 5.5");
@@ -359,6 +362,8 @@ describe("claude code runner", () => {
     expect(listHtml).toContain('href="conversations/plain"');
     expect(listHtml).toContain('href="conversations/linked"');
     expect(listHtml).not.toContain('class="current"');
+    expect(listHtml).toContain("<title>Rakazo code</title>");
+    expect(listHtml).toContain('href="https://rakazo.example.com/app"');
     expect(await (await fetch(`${base}/ui/conversations/`)).text()).toContain('href="./linked"');
     expect(await (await fetch(`${base}/ui/agents`)).text()).toContain('href="agents/linked"');
   });

@@ -26,6 +26,7 @@ Settings come from the environment, or from `.env` when started with `npm start`
 | `CLAUDE_MODEL` | Claude Code's default | The model every run uses, passed to `claude` as `--model`: an alias such as `opus` or `sonnet`, or a full model id. |
 | `GH_COMMAND` | `gh` | |
 | `APP_URL` | – | The service's base URL in a browser, e.g. `https://coder.example.com/@owner/workspace/apps/claude`. When set, responses include `url`, a link to the conversation page. |
+| `RAKAZO_URL` | `https://rakazo.jankirchner.cz/app` | Where the "Rakazo" link in the head of the conversation pages goes: the Rakazo app the conversations are launched from. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` or `silent`. At `info` the log shows one line per launch, follow-up, cancel, `claude` exit (turns, cost), push, PR and run end, plus every write request. `debug` adds the GET polls and each git/gh command. |
 
 ## Coder template
