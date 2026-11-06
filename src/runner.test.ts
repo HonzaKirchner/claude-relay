@@ -11,6 +11,7 @@ import { Store } from "./db.ts";
 import { createHandler } from "./http.ts";
 import type { ConversationView } from "./runner.ts";
 import { ConversationRunner } from "./runner.ts";
+import { terminalUrlOf } from "./ui.ts";
 
 // Quiet by default; run `LOG_LEVEL=info npm test` to see the service's log.
 process.env.LOG_LEVEL ??= "silent";
@@ -285,6 +286,20 @@ function claudeCalls() {
     .map((line) => JSON.parse(line) as string[]);
 }
 
+/** Waits until `claude` has been started `count` times: the checkouts are then prepared. */
+async function claudeStarted(count: number) {
+  for (;;) {
+    let started = 0;
+    try {
+      started = claudeCalls().length;
+    } catch {
+      // No call yet.
+    }
+    if (started >= count) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 /** A launch (PUT) names `REPOSITORY` unless the body says otherwise (`repository: undefined` names none). */
 async function call(method: string, pathname: string, body?: unknown) {
   const sent = method === "PUT" && body !== undefined ? { repository: REPOSITORY, ...(body as object) } : body;
@@ -421,9 +436,9 @@ describe("claude code runner", () => {
     expect(launchArgs![launchArgs!.indexOf("--append-system-prompt") + 1]).toContain("branch agent/agent-1");
   });
 
-  it("runs one conversation at a time per checkout and cancels a run", async () => {
+  it("runs one conversation at a time across the root and cancels a run", async () => {
     const launched = await call("PUT", "/conversations/busy", { prompt: "hang" });
-    // One checkout per repository: while a run is going in it, nothing else starts there.
+    // The checkouts together are one platform: while a run is going, nothing else starts anywhere.
     expect(await call("POST", "/conversations/busy/runs", { prompt: "More" })).toEqual({
       status: 409,
       body: { code: "busy", reason: "locked", conversation: "busy" },
@@ -432,13 +447,18 @@ describe("claude code runner", () => {
       status: 409,
       body: { code: "busy", reason: "locked", conversation: "busy" },
     });
+    expect(await call("PUT", "/conversations/elsewhere", { prompt: "hi", repository: OTHER })).toEqual({
+      status: 409,
+      body: { code: "busy", reason: "locked", conversation: "busy" },
+    });
     expect((await call("GET", "/conversations/other")).status).toBe(404);
+    expect((await call("GET", "/conversations/elsewhere")).status).toBe(404);
     const cancelled = await call("POST", `/conversations/busy/runs/${launched.body.runId}/cancel`);
     expect(cancelled.body.status).toBe("cancelled");
     expect(
       (await call("POST", `/conversations/busy/runs/${launched.body.runId}/cancel`)).body.status,
     ).toBe("cancelled");
-    // Once it has stopped, the checkout is free for anyone.
+    // Once it has stopped, the root is free for anyone.
     expect((await call("PUT", "/conversations/other", { prompt: "hi" })).status).toBe(200);
     await runner.idle();
     expect((await call("GET", "/conversations/other")).body.status).toBe("finished");
@@ -447,22 +467,17 @@ describe("claude code runner", () => {
     expect((await call("GET", "/conversations/busy")).body.status).toBe("finished");
   });
 
-  it("works in the checkout of the launch's repository, side by side with other repositories", async () => {
+  it("works in the checkout of the launch's repository and puts the other checkouts on their default branch", async () => {
     const demoRun = await call("PUT", "/conversations/demo-1", { prompt: "hang" });
-    // The other repository's checkout is free, so its run goes while demo's is going.
-    const otherRun = await call("PUT", "/conversations/other-1", { prompt: "hang", repository: OTHER });
-    expect(otherRun.body.status).toBe("running");
-    // Each checkout refuses with the conversation holding it.
-    expect(await call("PUT", "/conversations/demo-2", { prompt: "hi" })).toEqual({
+    // Another repository's checkout is free, but the platform is not: refused with the conversation running.
+    expect(await call("PUT", "/conversations/other-1", { prompt: "hang", repository: OTHER })).toEqual({
       status: 409,
       body: { code: "busy", reason: "locked", conversation: "demo-1" },
     });
-    expect(await call("PUT", "/conversations/other-2", { prompt: "hi", repository: `${OTHER}.git` })).toEqual({
-      status: 409,
-      body: { code: "busy", reason: "locked", conversation: "other-1" },
-    });
     expect((await call("POST", "/conversations/demo-1/runs", { prompt: "more" })).body).toMatchObject({ conversation: "demo-1" });
-    await call("POST", `/conversations/other-1/runs/${otherRun.body.runId}/cancel`);
+    await claudeStarted(1);
+    await call("POST", `/conversations/demo-1/runs/${demoRun.body.runId}/cancel`);
+    expect(git(checkout, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/demo-1");
 
     // `.git` and case are not a different repository.
     await call("PUT", "/conversations/other-2", { prompt: "Add a file", repository: "https://github.com/Example/other.git", openPr: true });
@@ -474,11 +489,30 @@ describe("claude code runner", () => {
     expect(filesOn("agent/other-2", otherOrigin)).toEqual(["README.md", expect.stringMatching(/^change-/)]);
     expect(git(other, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/other-2");
     expect(await sql("SELECT repository FROM conversations WHERE id = 'other-2'")).toEqual([{ repository: "https://github.com/Example/other" }]);
-    // Demo's checkout was never touched: still on its own running conversation's branch.
-    expect(git(checkout, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/demo-1");
-    expect((await call("GET", "/conversations/demo-1")).body.status).toBe("running");
-    await call("POST", `/conversations/demo-1/runs/${demoRun.body.runId}/cancel`);
+    // The run put demo's checkout back on its default branch: the platform is other-2's work on top of the defaults.
+    expect(git(checkout, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("main");
     expect(() => git(origin, "rev-parse", "--verify", "agent/other-2")).toThrow();
+
+    // The default branch is brought up to the origin where that is a fast-forward.
+    const seed = path.join(dir, "demo-seed");
+    git(seed, "checkout", "--quiet", "main");
+    writeFileSync(path.join(seed, "NEWS.md"), "news\n");
+    git(seed, "add", ".");
+    git(seed, "commit", "-m", "news");
+    git(seed, "push", origin, "main");
+    await call("POST", "/conversations/other-2/runs", { prompt: "Again" });
+    await runner.idle();
+    expect(git(checkout, "log", "--format=%s", "-1").trim()).toBe("news");
+    // A diverged default branch (a person's own commits) is left as it is, with a warning.
+    git(other, "checkout", "--quiet", "main");
+    writeFileSync(path.join(other, "LOCAL.md"), "local\n");
+    git(other, "add", ".");
+    git(other, "commit", "-m", "local");
+    await call("POST", "/conversations/demo-1/runs", { prompt: "Back" });
+    await runner.idle();
+    expect((await call("GET", "/conversations/demo-1")).body.status).toBe("finished");
+    expect(git(other, "log", "--format=%s", "-1").trim()).toBe("local");
+    expect(git(checkout, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/demo-1");
   });
 
   it("refuses a launch for a repository that is not checked out under the root", async () => {
@@ -557,10 +591,15 @@ describe("claude code runner", () => {
     expect((await call("GET", "/conversations/messy")).body).toMatchObject({ status: "failed" });
     expect(git(checkout, "status", "--porcelain")).toContain("leftover.txt");
 
-    // Another conversation would start on those changes: refused, and not created.
+    // Another conversation would start on those changes: refused, and not created. So is one
+    // in another repository: the checkouts together are one platform.
     expect(await call("PUT", "/conversations/next", { prompt: "hi" })).toEqual({
       status: 409,
-      body: { code: "busy", reason: "dirty", branch: "agent/messy" },
+      body: { code: "busy", reason: "dirty", branch: "agent/messy", path: checkout },
+    });
+    expect(await call("PUT", "/conversations/elsewhere", { prompt: "hi", repository: OTHER })).toEqual({
+      status: 409,
+      body: { code: "busy", reason: "dirty", branch: "agent/messy", path: checkout },
     });
     expect((await call("GET", "/conversations/next")).status).toBe(404);
 
@@ -576,13 +615,98 @@ describe("claude code runner", () => {
     expect(filesOn("agent/next")).toEqual(["README.md", expect.stringMatching(/^change-/)]);
     expect(git(checkout, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/next");
 
-    // A person's own changes in the checkout are refused as well, whatever branch they are on.
+    // A person's own changes in a checkout are refused as well, whatever branch they are on,
+    // even for a conversation working elsewhere.
     git(checkout, "checkout", "--quiet", "main");
     writeFileSync(path.join(checkout, "README.md"), "edited by hand\n");
     expect(await call("POST", "/conversations/next/runs", { prompt: "more" })).toEqual({
       status: 409,
-      body: { code: "busy", reason: "dirty", branch: "main" },
+      body: { code: "busy", reason: "dirty", branch: "main", path: checkout },
     });
+    git(checkout, "checkout", "--quiet", "README.md");
+    writeFileSync(path.join(other, "notes.txt"), "by hand\n");
+    expect(await call("POST", "/conversations/next/runs", { prompt: "more" })).toEqual({
+      status: 409,
+      body: { code: "busy", reason: "dirty", branch: "main", path: other },
+    });
+    expect((await call("GET", "/conversations/next")).body.status).toBe("finished");
+  });
+
+  it("describes the workspace: the run going and each checkout's branch", async () => {
+    const idle = await (await fetch(`${base}/workspace`)).json();
+    expect(idle).toEqual({
+      checkouts: [
+        { name: "demo", path: checkout, repository: REPOSITORY, branch: "main", dirty: false },
+        { name: "other", path: other, repository: OTHER, branch: "main", dirty: false },
+      ],
+    });
+    const launched = await call("PUT", "/conversations/busy", { prompt: "hang\nmore" });
+    await claudeStarted(1);
+    expect(await (await fetch(`${base}/workspace`)).json()).toEqual({
+      running: { conversation: "busy", title: "hang", runId: launched.body.runId, startedAt: expect.any(String), checkout },
+      checkouts: [
+        { name: "demo", path: checkout, repository: REPOSITORY, branch: "agent/busy", dirty: false, conversation: "busy" },
+        { name: "other", path: other, repository: OTHER, branch: "main", dirty: false },
+      ],
+    });
+    await call("POST", `/conversations/busy/runs/${launched.body.runId}/cancel`);
+    // The root itself when it is the checkout.
+    await restart({ root: checkout });
+    expect(await (await fetch(`${base}/workspace`)).json()).toEqual({
+      checkouts: [{ name: "demo", path: checkout, repository: REPOSITORY, branch: "agent/busy", dirty: false, conversation: "busy" }],
+    });
+  });
+
+  it("offers the page's message box for steering, a follow-up, or neither with the reason", async () => {
+    const page = async (id: string) => (await fetch(`${base}/ui/conversations/${id}`)).text();
+    await call("PUT", "/conversations/second", { prompt: "hi", repository: OTHER });
+    await runner.idle();
+    const launched = await call("PUT", "/conversations/first", { prompt: "hang" });
+    // The running conversation's page steers it; another conversation's page waits for it.
+    expect(await page("first")).toContain('<form class="composer" id="composer" data-mode="steer"');
+    let html = await page("second");
+    expect(html).toContain('data-mode="off"');
+    expect(html).toContain('<textarea name="prompt" rows="1" maxlength="100000" placeholder="Not available right now" aria-label="Message to Claude" disabled>');
+    expect(html).toContain('Claude is working on <a href="./first">hang</a>.');
+    expect(html).toContain('Working on <a href="./first">hang</a>');
+    // The list page shows the same workspace section.
+    expect(await (await fetch(`${base}/ui/conversations`)).text()).toContain('Working on <a href="conversations/first">hang</a>');
+    await call("POST", `/conversations/first/runs/${launched.body.runId}/cancel`);
+    // The runner is idle: both pages offer a follow-up.
+    for (const id of ["first", "second"]) {
+      html = await page(id);
+      expect(html).toContain('data-mode="reply"');
+      expect(html).toContain(`Starts a follow-up on <code>agent/${id}</code>`);
+    }
+
+    // A checkout with leftovers: its own conversation goes on, every other page says what to clean up.
+    await call("POST", "/conversations/first/runs", { prompt: "dirty" });
+    await runner.idle();
+    expect(await page("first")).toContain('data-mode="reply"');
+    html = await page("second");
+    expect(html).toContain('data-mode="off"');
+    expect(html).toContain("<strong>demo</strong> has uncommitted changes on <code>agent/first</code>.");
+    expect(html).toContain('<li class="checkout dirty"');
+    expect(html).toContain('<span class="flag">uncommitted changes</span>');
+
+    // A page waiting with no run of its own reloads when any run takes or gives back the root.
+    rmSync(path.join(checkout, "leftover.txt"));
+    const waiting = await openStream("/ui/conversations/second/stream");
+    expect((await waiting.next())?.event).toBe("ready");
+    const followup = await call("POST", "/conversations/first/runs", { prompt: "hang" });
+    expect((await waiting.next())?.event).toBe("reload");
+    const waitingAgain = await openStream("/ui/conversations/second/stream");
+    expect((await waitingAgain.next())?.event).toBe("ready");
+    await call("POST", `/conversations/first/runs/${followup.body.runId}/cancel`);
+    expect((await waitingAgain.next())?.event).toBe("reload");
+    expect(await page("second")).toContain('data-mode="reply"');
+  });
+
+  it("derives the workspace's terminal from the service's URL", () => {
+    expect(terminalUrlOf("https://coder.example.com/@me/ws/apps/claude")).toBe("https://coder.example.com/@me/ws/terminal");
+    expect(terminalUrlOf("https://coder.example.com/@me/ws/apps/claude/")).toBe("https://coder.example.com/@me/ws/terminal");
+    expect(terminalUrlOf("https://claude--ws--me.coder.example.com")).toBeUndefined();
+    expect(terminalUrlOf(undefined)).toBeUndefined();
   });
 
   it("starts a conversation from the named base branch", async () => {

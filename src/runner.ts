@@ -1,8 +1,8 @@
 import type { ChildProcess } from "node:child_process";
 import type { Writable } from "node:stream";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { stat } from "node:fs/promises";
+import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import type { ClaudeEvent, Conversation, Run, RunMessage, RunStatus, Store, StoredEvent } from "./db.ts";
 import { log, since } from "./log.ts";
@@ -58,7 +58,20 @@ export interface Transcript {
   pushed: boolean;
   prUrl?: string;
   runs: Array<Run & { seq: number; events: StoredEvent[] }>;
+  /** What the page's message box can do right now. */
+  composer: ComposerState;
 }
+
+/**
+ * What the message box at the bottom of a conversation page does: steers the conversation's
+ * running run, starts a follow-up, or nothing, with the reason the follow-up would be refused.
+ */
+export type ComposerState =
+  | { mode: "steer"; runId: string }
+  | { mode: "reply" }
+  | { mode: "off"; reason: "locked"; conversation: string; title: string }
+  | { mode: "off"; reason: "dirty"; name: string; path: string; branch: string }
+  | { mode: "off"; reason: "no_checkout"; repository?: string };
 
 /** One line of the conversation list on the transcript page. */
 export interface ConversationSummary {
@@ -68,8 +81,34 @@ export interface ConversationSummary {
   status: Run["status"];
   runCount: number;
   repository?: string;
+  branch?: string;
   /** When the latest run started or finished, whichever is later. */
   updatedAt: string;
+}
+
+/** One git checkout under the root, as the workspace section of the pages shows it. */
+export interface Checkout {
+  /** The directory's name; the root's own when the root is the checkout. */
+  name: string;
+  path: string;
+  /** The origin, as a browser link. */
+  repository: string;
+  /** The branch it is on; empty when HEAD is detached. */
+  branch: string;
+  /** Has uncommitted changes. */
+  dirty: boolean;
+  /** The conversation whose branch it is on, when it is on one. */
+  conversation?: string;
+}
+
+/**
+ * The checkouts under the root and the run going in them. The checkouts together are one
+ * platform, so one run goes at a time across all of them, and every one of them is put on a
+ * known branch when a run starts.
+ */
+export interface Workspace {
+  running?: { conversation: string; title: string; runId: string; startedAt: string; checkout?: string };
+  checkouts: Checkout[];
 }
 
 export interface RunnerOptions {
@@ -112,23 +151,26 @@ export type LiveUpdate =
   | { type: "start"; runId: string }
   | { type: "end"; runId: string };
 
-/** A run was asked for while another one is going in the same checkout: one run at a time per checkout. */
+/** A run was asked for while another one is going: one run at a time across the root. */
 export class ConversationBusy extends Error {
   /** The conversation whose run is going. */
   readonly conversation: string;
   constructor(conversation: string) {
-    super("Another run is going in the checkout.");
+    super("Another run is going.");
     this.conversation = conversation;
   }
 }
 
-/** The checkout has uncommitted changes that are not the conversation's own, so a run cannot start on it. */
+/** A checkout under the root has uncommitted changes that are not the conversation's own, so no run can start. */
 export class CheckoutDirty extends Error {
   /** The branch the checkout is on. */
   readonly branch: string;
-  constructor(branch: string) {
-    super("The checkout has uncommitted changes.");
+  /** The checkout with the changes. */
+  readonly path: string;
+  constructor(branch: string, checkoutPath: string) {
+    super("A checkout has uncommitted changes.");
     this.branch = branch;
+    this.path = checkoutPath;
   }
 }
 
@@ -194,16 +236,19 @@ const MAX_ERROR = 500;
  * full text stays in the database (`runs.result_text`).
  */
 const SUMMARY_MAX = 20_000;
+/** How long a scan of the checkouts (branch, uncommitted changes) serves the pages before a new one. */
+const WORKSPACE_TTL_MS = 3_000;
 
 /**
  * Runs one headless Claude Code session per conversation, in the checkout of the conversation's
  * repository under `root`, each on its own branch, and publishes the result as that branch (and
  * optionally a pull request).
  *
- * A checkout is shared by every conversation of its repository, so one run goes at a time in it:
- * a launch or follow-up while another conversation's run is going there is refused
- * (`ConversationBusy`), as is one while the checkout has leftover changes of another
- * conversation or of a person (`CheckoutDirty`). Runs in different checkouts go side by side.
+ * The checkouts under the root together are one platform, so one run goes at a time across all
+ * of them: a launch or follow-up while another conversation's run is going is refused
+ * (`ConversationBusy`), as is one while any checkout has leftover changes of another
+ * conversation or of a person (`CheckoutDirty`). A run puts its own checkout on the
+ * conversation's branch and every other checkout on its default branch.
  *
  * Every conversation and run lives in the database. The in-memory map is a cache filled
  * from it at start; a change counts only once the database has it.
@@ -212,10 +257,17 @@ export class ConversationRunner {
   private readonly options: RunnerOptions;
   private readonly store: Store;
   private readonly conversations = new Map<string, Conversation>();
-  /** By checkout path: the conversation holding it, the one whose run is going or being started. */
-  private readonly current = new Map<string, string>();
+  /** The conversation whose run is going or being started: the one lock over the whole root. */
+  private current?: string;
   /** By conversation: the checkout its run works in, from `acquire` until the run ends. */
   private readonly checkouts = new Map<string, string>();
+  /** The last scan of the checkouts, and when it was started; see `workspace`. */
+  private scanned?: Promise<Checkout[]>;
+  private scannedAt = 0;
+  /** The default branch of each checkout under the root, by path, once read from its origin. */
+  private readonly defaults = new Map<string, string>();
+  /** Told whenever the lock changes hands; see `watch`. */
+  private readonly watchers = new Set<() => void>();
   /** The child process a conversation is waiting on right now (git, claude or gh). */
   private readonly children = new Map<string, ChildProcess>();
   private readonly active = new Map<string, Promise<void>>();
@@ -290,27 +342,26 @@ export class ConversationRunner {
   }
 
   /**
-   * Finds the conversation's checkout and takes it for the next run. Refused while another run
-   * is going in it, and while it has uncommitted changes, unless it is on the conversation's own
-   * branch: those are its own leftovers (a failed or cancelled run), which the run goes on from.
+   * Takes the root for the next run and finds the conversation's checkout. Refused while another
+   * run is going, and while any checkout under the root has uncommitted changes, unless they are
+   * in the conversation's own checkout on its own branch: those are its own leftovers (a failed
+   * or cancelled run), which the run goes on from.
    */
   private async acquire(conversation: Conversation) {
-    const checkout = await this.locate(conversation);
-    const holder = this.current.get(checkout);
-    if (holder) {
-      log.info("run refused, another run is going in the checkout", { conversation: conversation.id, running: holder, checkout });
-      throw new ConversationBusy(holder);
+    if (this.current) {
+      log.info("run refused, another run is going", { conversation: conversation.id, running: this.current });
+      throw new ConversationBusy(this.current);
     }
     // Set before anything awaits, so a request arriving meanwhile is refused.
-    this.current.set(checkout, conversation.id);
-    this.checkouts.set(conversation.id, checkout);
+    this.current = conversation.id;
+    this.changed();
     try {
-      if ((await this.exec(conversation, "git", ["status", "--porcelain"])).trim()) {
-        const head = (await this.exec(conversation, "git", ["rev-parse", "--abbrev-ref", "HEAD"])).trim();
-        if (head !== conversation.branch) {
-          log.warn("run refused, the checkout has uncommitted changes", { conversation: conversation.id, checkout, branch: head });
-          throw new CheckoutDirty(head);
-        }
+      const checkout = await this.locate(conversation);
+      this.checkouts.set(conversation.id, checkout);
+      for (const item of await this.scan()) {
+        if (!item.dirty || (item.path === checkout && item.branch === conversation.branch)) continue;
+        log.warn("run refused, a checkout has uncommitted changes", { conversation: conversation.id, checkout: item.path, branch: item.branch });
+        throw new CheckoutDirty(item.branch, item.path);
       }
     } catch (error) {
       this.release(conversation);
@@ -318,11 +369,101 @@ export class ConversationRunner {
     }
   }
 
-  /** Gives the checkout back once the run has ended, or never started. */
+  /** Gives the root back once the run has ended, or never started. */
   private release(conversation: Conversation) {
-    const checkout = this.checkouts.get(conversation.id);
-    if (checkout !== undefined && this.current.get(checkout) === conversation.id) this.current.delete(checkout);
     this.checkouts.delete(conversation.id);
+    if (this.current !== conversation.id) return;
+    this.current = undefined;
+    this.changed();
+  }
+
+  /** The lock changed hands, or a run changed the checkouts: the pages' workspace section is stale. */
+  private changed() {
+    this.scanned = undefined;
+    for (const watcher of this.watchers) {
+      try {
+        watcher();
+      } catch (error) {
+        log.error("workspace watcher failed", { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+  }
+
+  /** Calls `listener` whenever a run takes or gives back the root, until the returned function is called. */
+  watch(listener: () => void): () => void {
+    this.watchers.add(listener);
+    return () => this.watchers.delete(listener);
+  }
+
+  /**
+   * The checkouts under the root with their branches, and the run going. Read-only: the
+   * scan only asks git; nothing outside a run ever writes to a checkout. Scans are cached
+   * for `WORKSPACE_TTL_MS` since the pages ask often.
+   */
+  async workspace(): Promise<Workspace> {
+    if (!this.scanned || Date.now() - this.scannedAt > WORKSPACE_TTL_MS) {
+      this.scannedAt = Date.now();
+      const scan = (this.scanned = this.scan());
+      scan.catch(() => {
+        if (this.scanned === scan) this.scanned = undefined;
+      });
+    }
+    const checkouts = await this.scanned;
+    const byBranch = new Map<string, string>();
+    for (const conversation of this.conversations.values())
+      if (conversation.branch && conversation.repository)
+        byBranch.set(`${repositoryKey(conversation.repository)}#${conversation.branch}`, conversation.id);
+    const running = this.current ? this.conversations.get(this.current) : undefined;
+    const run = running?.runs.at(-1);
+    return {
+      ...(running && run
+        ? {
+            running: {
+              conversation: running.id,
+              title: running.title,
+              runId: run.id,
+              startedAt: run.startedAt,
+              ...(this.checkouts.has(running.id) ? { checkout: this.checkouts.get(running.id) } : {}),
+            },
+          }
+        : {}),
+      checkouts: checkouts.map((checkout) => {
+        const conversation = byBranch.get(`${repositoryKey(checkout.repository)}#${checkout.branch}`);
+        return conversation ? { ...checkout, conversation } : checkout;
+      }),
+    };
+  }
+
+  /** Every git checkout under the root (and the root itself when it is one), freshly inspected. */
+  private async scan(): Promise<Checkout[]> {
+    const { root } = this.options;
+    const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+    const names = entries.filter((entry) => entry.isDirectory() && !entry.name.startsWith(".")).map((entry) => entry.name).sort();
+    const dirs = [root, ...names.map((name) => path.join(root, name))];
+    const found = await Promise.all(dirs.map((dir) => this.inspect(dir)));
+    return found.filter((checkout): checkout is Checkout => checkout !== undefined);
+  }
+
+  /** `dir` as a checkout, or undefined when it is none (or has no origin). */
+  private async inspect(dir: string): Promise<Checkout | undefined> {
+    if (!(await stat(path.join(dir, ".git")).then(() => true, () => false))) return undefined;
+    const git = (args: string[]) => this.read(dir, args).catch(() => "");
+    const origin = (await git(["config", "--get", "remote.origin.url"])).trim();
+    if (!origin) return undefined;
+    const [branch, status] = await Promise.all([git(["branch", "--show-current"]), git(["status", "--porcelain"])]);
+    return { name: path.basename(dir), path: dir, repository: repositoryUrl(origin), branch: branch.trim(), dirty: Boolean(status.trim()) };
+  }
+
+  /** Runs a read-only git command in `dir`, outside any run, so it is not a run's child and cancel does not reach it. */
+  private read(dir: string, args: string[]): Promise<string> {
+    return new Promise((resolve, reject) => {
+      execFile(
+        "git",
+        args,
+        { cwd: dir, env: { ...(this.options.env ?? process.env), GIT_TERMINAL_PROMPT: "0" }, maxBuffer: 1024 * 1024 },
+        (error, stdout) => (error ? reject(error) : resolve(stdout)),
+      );
+    });
   }
 
   /**
@@ -381,6 +522,7 @@ export class ConversationRunner {
           status: run.status,
           runCount: conversation.runs.length,
           ...(conversation.repository ? { repository: conversation.repository } : {}),
+          ...(conversation.branch ? { branch: conversation.branch } : {}),
           updatedAt: run.finishedAt ?? run.startedAt,
         };
       })
@@ -392,7 +534,7 @@ export class ConversationRunner {
     const conversation = this.conversations.get(id);
     if (!conversation) return undefined;
     const runs = [...conversation.runs];
-    const events = await this.store.events(runs.map((run) => run.id));
+    const [events, workspace] = await Promise.all([this.store.events(runs.map((run) => run.id)), this.workspace()]);
     return {
       id: conversation.id,
       title: conversation.title,
@@ -401,7 +543,30 @@ export class ConversationRunner {
       pushed: conversation.pushed,
       ...(conversation.prUrl ? { prUrl: conversation.prUrl } : {}),
       runs: runs.map((run, index) => ({ ...run, seq: index + 1, events: events.get(run.id) ?? [] })),
+      composer: this.composer(conversation, workspace),
     };
+  }
+
+  /**
+   * What the conversation page's message box can do: steer the conversation's own running run;
+   * start a follow-up, when nothing runs and no checkout is dirty (as `acquire` will check
+   * again); or nothing, with the reason a follow-up would be refused.
+   */
+  private composer(conversation: Conversation, workspace: Workspace): ComposerState {
+    const run = conversation.runs.at(-1);
+    if (run?.status === "running") return { mode: "steer", runId: run.id };
+    if (workspace.running)
+      return { mode: "off", reason: "locked", conversation: workspace.running.conversation, title: workspace.running.title };
+    const { repository } = conversation;
+    // As `locate` picks it: the checkout named after the repository, else the root itself.
+    const own =
+      repository &&
+      (workspace.checkouts.find((item) => item.path !== this.options.root && sameRepository(item.repository, repository)) ??
+        workspace.checkouts.find((item) => item.path === this.options.root && sameRepository(item.repository, repository)));
+    if (!own) return { mode: "off", reason: "no_checkout", ...(repository ? { repository } : {}) };
+    const dirty = workspace.checkouts.find((item) => item.dirty && !(item.path === own.path && item.branch === conversation.branch));
+    if (dirty) return { mode: "off", reason: "dirty", name: dirty.name, path: dirty.path, branch: dirty.branch };
+    return { mode: "reply" };
   }
 
   async reply(id: string, request: PromptRequest): Promise<ConversationView | undefined> {
@@ -670,12 +835,27 @@ export class ConversationRunner {
   }
 
   /**
+   * Puts the conversation's checkout on its branch and every other checkout under the root on
+   * its default branch, so the platform the checkouts make up is "this conversation's work on
+   * top of the defaults".
+   */
+  private async prepare(conversation: Conversation) {
+    try {
+      await this.prepareOwn(conversation);
+      const own = this.checkoutOf(conversation);
+      for (const checkout of await this.scan()) if (checkout.path !== own) await this.prepareOther(conversation, checkout);
+    } finally {
+      this.scanned = undefined;
+    }
+  }
+
+  /**
    * Puts the checkout on the conversation's branch. A new conversation's branch starts from the
    * origin's base branch, freshly fetched. A conversation whose branch is not in the checkout
    * (made before the checkout was shared) gets it back from the origin if it was pushed, and
    * otherwise starts again from the base branch.
    */
-  private async prepare(conversation: Conversation) {
+  private async prepareOwn(conversation: Conversation) {
     const branch = conversation.branch!;
     const git = (args: string[], error: string) => this.exec(conversation, "git", args, { error });
     const head = (await git(["rev-parse", "--abbrev-ref", "HEAD"], "Could not read the checkout.")).trim();
@@ -701,6 +881,28 @@ export class ConversationRunner {
     }
   }
 
+  /**
+   * Puts another checkout on its default branch, brought up to the origin where that is a
+   * fast-forward. It is clean (`acquire` checked), so switching cannot lose anything; local
+   * commits on the branch are a person's and stay, as does a branch the origin cannot be
+   * reached for, with a warning. Only failing to switch fails the run: the platform would not
+   * be what the conversation expects.
+   */
+  private async prepareOther(conversation: Conversation, checkout: Checkout) {
+    const branch = await this.defaultBranch(conversation, checkout.path);
+    const git = (args: string[], options: { error?: string; quiet?: boolean } = {}) =>
+      this.exec(conversation, "git", args, { cwd: checkout.path, ...options });
+    const fields = { conversation: conversation.id, checkout: checkout.path, branch };
+    const fetched = await git(["fetch", "origin", branch], { quiet: true }).then(() => true, () => false);
+    if (!fetched) log.warn("could not fetch a checkout's default branch, using what it has", fields);
+    if (checkout.branch !== branch) {
+      await git(["checkout", branch], { error: `Could not put ${checkout.name} on its default branch ${branch}.` });
+      log.info("checkout put on its default branch", { ...fields, was: checkout.branch || "detached" });
+    }
+    if (fetched && !(await git(["merge", "--ff-only", `origin/${branch}`], { quiet: true }).then(() => true, () => false)))
+      log.warn("a checkout's default branch has diverged from the origin, left as it is", fields);
+  }
+
   private async hasRef(conversation: Conversation, ref: string) {
     return this.exec(conversation, "git", ["rev-parse", "--verify", "--quiet", ref], { quiet: true }).then(
       () => true,
@@ -708,14 +910,26 @@ export class ConversationRunner {
     );
   }
 
-  /** The origin's default branch, e.g. `main`, from its HEAD. */
-  private async defaultBranch(conversation: Conversation) {
-    const output = await this.exec(conversation, "git", ["ls-remote", "--symref", "origin", "HEAD"], {
-      error: "Could not read the origin's default branch.",
-    });
-    const match = /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(output);
-    if (!match) throw new Error("Could not read the origin's default branch.");
-    return match[1]!;
+  /**
+   * The origin's default branch, e.g. `main`, from its HEAD: as the clone recorded it
+   * (`origin/HEAD`), else asked from the origin. Remembered per checkout.
+   */
+  private async defaultBranch(conversation: Conversation, cwd = this.checkoutOf(conversation)) {
+    const known = this.defaults.get(cwd);
+    if (known) return known;
+    const recorded = await this.exec(conversation, "git", ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], { cwd, quiet: true }).catch(() => "");
+    let branch = recorded.trim().replace(/^origin\//, "");
+    if (!branch) {
+      const output = await this.exec(conversation, "git", ["ls-remote", "--symref", "origin", "HEAD"], {
+        cwd,
+        error: "Could not read the origin's default branch.",
+      });
+      const match = /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(output);
+      if (!match) throw new Error("Could not read the origin's default branch.");
+      branch = match[1]!;
+    }
+    this.defaults.set(cwd, branch);
+    return branch;
   }
 
   private async claude(
@@ -1054,6 +1268,9 @@ export function checkoutName(repository: string): string | undefined {
 
 /** Whether two repository URLs name the same repository, whatever their case, `.git` or trailing slash. */
 function sameRepository(a: string, b: string) {
-  const key = (url: string) => url.trim().replace(/\/+$/, "").replace(/\.git$/, "").toLowerCase();
-  return key(a) === key(b);
+  return repositoryKey(a) === repositoryKey(b);
+}
+
+function repositoryKey(url: string) {
+  return url.trim().replace(/\/+$/, "").replace(/\.git$/, "").toLowerCase();
 }

@@ -5,6 +5,7 @@ import { Store } from "./db.ts";
 import { createHandler } from "./http.ts";
 import { log } from "./log.ts";
 import { ConversationRunner } from "./runner.ts";
+import { terminalUrlOf } from "./ui.ts";
 
 const connectionString = process.env.DB_CONNECTION_STRING;
 if (!connectionString) {
@@ -24,8 +25,14 @@ const options = {
   // When set, every ConversationView carries `url`, a link to the conversation page.
   publicUrl: process.env.APP_URL || undefined,
 };
-// Where the pages' "Rakazo" link goes: the Rakazo app the conversations are launched from.
-const rakazoUrl = process.env.RAKAZO_URL || "https://rakazo.jankirchner.cz/app";
+// Where the pages' links go: the Rakazo app the conversations are launched from, the console
+// the workspace serves from its checkouts, and the workspace's terminal (Coder's, derived from
+// APP_URL) for cleaning up a checkout by hand.
+const pages = {
+  rakazoUrl: process.env.RAKAZO_URL || "https://rakazo.jankirchner.cz/app",
+  consoleUrl: process.env.CONSOLE_URL || undefined,
+  terminalUrl: terminalUrlOf(options.publicUrl),
+};
 log.info("starting", {
   root: options.root,
   baseBranch: options.baseBranch ?? "the origin's default branch",
@@ -33,7 +40,9 @@ log.info("starting", {
   model: options.claudeModel ?? "Claude Code's default",
   gh: options.ghCommand,
   appUrl: options.publicUrl ?? "unset (responses carry no url)",
-  rakazoUrl,
+  rakazoUrl: pages.rakazoUrl,
+  consoleUrl: pages.consoleUrl ?? "unset (no console link)",
+  terminalUrl: pages.terminalUrl ?? "unset (no terminal link)",
   logLevel: process.env.LOG_LEVEL || "info",
 });
 
@@ -59,7 +68,7 @@ try {
 }
 
 const port = Number(process.env.PORT || 4115);
-const server = createServer(createHandler(runner, { rakazoUrl })).listen(port, "127.0.0.1", () => {
+const server = createServer(createHandler(runner, pages)).listen(port, "127.0.0.1", () => {
   log.info(`claude-code-runner listening on 127.0.0.1:${port}`);
 });
 

@@ -1,4 +1,4 @@
-import type { ConversationSummary, RunMessage, Transcript } from "./runner.ts";
+import type { ComposerState, ConversationSummary, RunMessage, Transcript, Workspace } from "./runner.ts";
 
 type Block = Record<string, unknown>;
 
@@ -6,6 +6,20 @@ type Block = Record<string, unknown>;
 export interface PageOptions {
   /** Where the "Rakazo" link in the sidebar head goes: Rakazo's app, which the pages are opened from. Without it there is no link. */
   rakazoUrl?: string;
+  /** The console the workspace serves from its checkouts, linked from the workspace section. Without it there is no link. */
+  consoleUrl?: string;
+  /** A terminal in the workspace, for cleaning up a checkout by hand; see `terminalUrlOf`. Without it there is no link. */
+  terminalUrl?: string;
+}
+
+/**
+ * Coder's web terminal for the workspace the service runs in, from the service's own URL
+ * through Coder's app proxy (`https://coder.example.com/@owner/workspace/apps/claude`):
+ * `https://coder.example.com/@owner/workspace/terminal`. Undefined for any other URL.
+ */
+export function terminalUrlOf(appUrl: string | undefined): string | undefined {
+  const match = appUrl && /^(https?:\/\/[^/]+\/@[^/]+\/[^/]+)\/apps\/[^/]+\/?$/.exec(appUrl);
+  return match ? `${match[1]}/terminal` : undefined;
 }
 type TranscriptRun = Transcript["runs"][number];
 
@@ -18,8 +32,15 @@ const MAX_OUTPUT = 20_000;
  * left lists every conversation, one on the right sums up this one (status, cost by model, ...).
  * The page follows the conversation over `<page>/stream` (see `LiveRunRenderer`): new events are
  * appended as they come, and when a run starts or ends the page fetches itself and swaps in.
+ * The message box at the bottom steers the running run, or starts a follow-up when nothing
+ * runs; while another conversation's run goes, or a checkout needs cleaning up, it says so.
  */
-export function transcriptPage(transcript: Transcript, conversations: ConversationSummary[] = [], options: PageOptions = {}): string {
+export function transcriptPage(
+  transcript: Transcript,
+  conversations: ConversationSummary[] = [],
+  workspace: Workspace = { checkouts: [] },
+  options: PageOptions = {},
+): string {
   const live = transcript.runs.find((run) => run.status === "running");
   const running = Boolean(live);
   const runs = transcript.runs.map((run) => renderRun(run)).join("\n");
@@ -38,6 +59,7 @@ export function transcriptPage(transcript: Transcript, conversations: Conversati
 <div class="layout">
 <aside class="sidebar left" aria-label="Conversations">
 ${sidebarHead(options, `<label for="toggle-nav" class="close" title="Close">${ICONS.x}</label>`)}
+${workspaceSection(workspace, conversations, "./", options)}
 <nav id="conversations">${conversationList(conversations, transcript.id)}</nav>
 </aside>
 <div class="center">
@@ -46,10 +68,7 @@ ${sidebarHead(options, `<label for="toggle-nav" class="close" title="Close">${IC
 ${runs}
 </div>
 </main>
-<form class="composer" id="composer" autocomplete="off">
-<div class="composer-box"><textarea name="prompt" rows="1" maxlength="100000" placeholder="Steer Claude while it works…" aria-label="Message to Claude"></textarea><button type="submit" title="Send (Enter)" aria-label="Send">${ICONS.send}</button></div>
-<div class="composer-hint" aria-live="polite">Claude reads it at its next step. Shift+Enter for a new line.</div>
-</form>
+${composer(transcript, "./", options)}
 </div>
 <aside class="sidebar right" aria-label="Conversation details">
 <div class="sidebar-head"><span>Details</span><label for="toggle-stats" class="close" title="Close">${ICONS.x}</label></div>
@@ -68,8 +87,13 @@ ${runs}
  * open. `hrefPrefix` makes the links relative to the URL the page was served at, so they keep
  * working behind Coder's app proxy.
  */
-export function conversationsPage(conversations: ConversationSummary[], hrefPrefix: string, options: PageOptions = {}): string {
-  const running = conversations.some((conversation) => conversation.status === "running");
+export function conversationsPage(
+  conversations: ConversationSummary[],
+  workspace: Workspace,
+  hrefPrefix: string,
+  options: PageOptions = {},
+): string {
+  const running = Boolean(workspace.running) || conversations.some((conversation) => conversation.status === "running");
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -83,6 +107,7 @@ export function conversationsPage(conversations: ConversationSummary[], hrefPref
 <div class="layout index">
 <aside class="sidebar left" aria-label="Conversations">
 ${sidebarHead(options)}
+${workspaceSection(workspace, conversations, hrefPrefix, options)}
 <nav id="conversations">${conversationList(conversations, undefined, hrefPrefix)}</nav>
 </aside>
 <div class="center">
@@ -100,6 +125,73 @@ function sidebarHead(options: PageOptions, close = ""): string {
     ? `<a class="back" href="${escape(options.rakazoUrl)}" title="Back to Rakazo">${ICONS.arrowLeft}<span>Rakazo</span></a>`
     : "";
   return `<div class="sidebar-head"><span class="spark">${ICONS.spark}</span><span>Rakazo code</span>${back}${close}</div>`;
+}
+
+/**
+ * The top of the conversation sidebar: whether a run is going (and whose, for how long) or the
+ * workspace is idle, links to its console and terminal, and each checkout under the root with
+ * the branch it is on, the conversation that branch belongs to, and whether it has uncommitted
+ * changes. The checkouts together are what the workspace builds and serves.
+ */
+function workspaceSection(workspace: Workspace, conversations: ConversationSummary[], hrefPrefix: string, options: PageOptions): string {
+  const titles = new Map(conversations.map((conversation) => [conversation.id, conversation.title]));
+  const page = (id: string) => `${hrefPrefix}${encodeURIComponent(id)}`;
+  const { running } = workspace;
+  const status = running
+    ? `<span class="dot running"></span><span class="ws-status">Working on <a href="${page(running.conversation)}">${escape(running.title)}</a></span><span class="elapsed" data-elapsed="${Math.max(0, Date.now() - Date.parse(running.startedAt))}">${timer(Math.max(0, Date.now() - Date.parse(running.startedAt)))}</span>`
+    : `<span class="dot idle"></span><span class="ws-status">Idle</span>`;
+  const tools = [
+    options.consoleUrl ? `<a class="tool-link" href="${escape(options.consoleUrl)}" target="_blank" rel="noopener">${ICONS.globe}Console</a>` : "",
+    options.terminalUrl ? `<a class="tool-link" href="${escape(options.terminalUrl)}" target="_blank" rel="noopener">${ICONS.terminal}Terminal</a>` : "",
+  ].join("");
+  const rows = workspace.checkouts
+    .map((checkout) => {
+      const title = checkout.conversation ? titles.get(checkout.conversation) : undefined;
+      const state = running?.checkout === checkout.path ? "running" : checkout.dirty ? "dirty" : "";
+      const branch = checkout.branch ? `<code>${escape(checkout.branch)}</code>` : '<span class="hint">detached</span>';
+      const owner = checkout.conversation && title ? ` · <a href="${page(checkout.conversation)}" title="${escape(title)}">${escape(title)}</a>` : "";
+      return `<li class="checkout${state ? ` ${state}` : ""}" title="${escape(checkout.path)}"><span class="checkout-name">${ICONS.repo}${link(checkout.repository, checkout.name)}${checkout.dirty ? '<span class="flag">uncommitted changes</span>' : ""}</span><span class="checkout-branch">${ICONS.branch}<span>${branch}${owner}</span></span></li>`;
+    })
+    .join("");
+  return `<section id="workspace" class="workspace" aria-label="Workspace">
+<div class="ws-head">${status}</div>
+${tools ? `<div class="ws-tools">${tools}</div>` : ""}
+${rows ? `<ul class="checkouts">${rows}</ul>` : '<p class="empty">No checkouts under the root.</p>'}
+</section>`;
+}
+
+/**
+ * The message box at the bottom of a conversation page. What it does depends on
+ * `transcript.composer`: a message to the running run, a follow-up, or nothing but the reason.
+ * The page's script keeps the form and swaps these parts in when the page reloads itself.
+ */
+function composer(transcript: Transcript, hrefPrefix: string, options: PageOptions): string {
+  const state = transcript.composer;
+  const off = state.mode === "off";
+  const placeholder = state.mode === "steer" ? "Steer Claude while it works…" : state.mode === "reply" ? "Send a follow-up…" : "Not available right now";
+  return `<form class="composer" id="composer" data-mode="${state.mode}" autocomplete="off">
+<div class="composer-box"><textarea name="prompt" rows="1" maxlength="100000" placeholder="${placeholder}" aria-label="Message to Claude"${off ? " disabled" : ""}></textarea><button type="submit" title="Send (Enter)" aria-label="Send"${off ? " disabled" : ""}>${ICONS.send}</button></div>
+<div class="composer-hint" aria-live="polite">${composerHint(state, transcript, hrefPrefix, options)}</div>
+</form>`;
+}
+
+function composerHint(state: ComposerState, transcript: Transcript, hrefPrefix: string, options: PageOptions): string {
+  const terminal = options.terminalUrl ? `<a href="${escape(options.terminalUrl)}" target="_blank" rel="noopener">terminal</a>` : "terminal";
+  switch (state.mode) {
+    case "steer":
+      return "Claude reads it at its next step. Shift+Enter for a new line.";
+    case "reply":
+      return `Starts a follow-up${transcript.branch ? ` on <code>${escape(transcript.branch)}</code>` : ""}, resuming this conversation. Shift+Enter for a new line.`;
+    case "off":
+      switch (state.reason) {
+        case "locked":
+          return `Claude is working on <a href="${hrefPrefix}${encodeURIComponent(state.conversation)}">${escape(state.title)}</a>. One run goes at a time; this conversation can go on once it ends.`;
+        case "dirty":
+          return `<strong>${escape(state.name)}</strong> has uncommitted changes on <code>${escape(state.branch)}</code>. Commit, stash or discard them in the ${terminal} first.`;
+        case "no_checkout":
+          return `${state.repository ? `${escape(repoName(state.repository))} is` : "This conversation's repository is"} not checked out under the root any more. Clone it again to go on.`;
+      }
+  }
 }
 
 function conversationList(conversations: ConversationSummary[], currentId?: string, hrefPrefix = "./"): string {
@@ -560,10 +652,11 @@ function timer(ms: number): string {
   return hours ? `${hours}:${pad(minutes)}:${pad(seconds % 60)}` : `${minutes}:${pad(seconds % 60)}`;
 }
 
-/** The two sidebars, re-rendered while a run goes so cost, counts and statuses keep up. */
-export function sidePanels(transcript: Transcript, conversations: ConversationSummary[]): LiveOp[] {
+/** The two sidebars, re-rendered while a run goes so cost, counts, statuses and the checkouts keep up. */
+export function sidePanels(transcript: Transcript, conversations: ConversationSummary[], workspace: Workspace, options: PageOptions = {}): LiveOp[] {
   return [
     { op: "replace", id: "stats", html: `<div id="stats">${statsPanel(transcript)}</div>` },
+    { op: "replace", id: "workspace", html: workspaceSection(workspace, conversations, "./", options) },
     { op: "replace", id: "conversations", html: `<nav id="conversations">${conversationList(conversations, transcript.id)}</nav>` },
   ];
 }
@@ -967,8 +1060,10 @@ const POLL_SCRIPT = `
     } catch {
       return setTimeout(tick, 5000);
     }
-    const next = doc.getElementById("conversations");
-    if (next) document.getElementById("conversations")?.replaceWith(next);
+    for (const id of ["workspace", "conversations"]) {
+      const next = doc.getElementById(id);
+      if (next) document.getElementById(id)?.replaceWith(next);
+    }
     if (doc.body.hasAttribute("data-running")) setTimeout(tick, 2000);
   }
   setTimeout(tick, 2000);
@@ -1067,7 +1162,7 @@ const STREAM_SCRIPT = `
       return restart(5000);
     }
     change(() => {
-      for (const id of ["log", "conversations", "stats"]) {
+      for (const id of ["log", "workspace", "conversations", "stats"]) {
         const next = doc.getElementById(id);
         if (next) document.getElementById(id)?.replaceWith(next);
       }
@@ -1077,13 +1172,24 @@ const STREAM_SCRIPT = `
       if (doc.body.dataset[name] === undefined) delete body.dataset[name];
       else body.dataset[name] = doc.body.dataset[name];
     }
+    // The form stays (what is typed is kept); its mode and hint follow the fresh page.
+    const next = doc.getElementById("composer");
+    if (next) {
+      form.dataset.mode = next.dataset.mode;
+      field.placeholder = next.elements.prompt.placeholder;
+      field.disabled = button.disabled = next.dataset.mode === "off";
+      hint.innerHTML = defaultHint = next.querySelector(".composer-hint").innerHTML;
+      hint.classList.remove("error");
+    }
     connect();
   }
-  // Sends what is typed to the running run (POST <api>/conversations/:id/runs/:runId/messages).
+  // Sends what is typed: to the running run (POST <api>/conversations/:id/runs/:runId/messages)
+  // while this conversation runs, else as a follow-up (POST <api>/conversations/:id/runs).
   const form = document.getElementById("composer");
   const field = form.elements.prompt;
+  const button = form.querySelector("button");
   const hint = form.querySelector(".composer-hint");
-  const defaultHint = hint.textContent;
+  let defaultHint = hint.innerHTML;
   const fit = () => {
     field.style.height = "auto";
     field.style.height = Math.min(field.scrollHeight, 200) + "px";
@@ -1098,21 +1204,29 @@ const STREAM_SCRIPT = `
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const prompt = field.value;
-    if (!prompt.trim() || !body.dataset.run || form.classList.contains("sending")) return;
+    const mode = form.dataset.mode;
+    if (!prompt.trim() || mode === "off" || form.classList.contains("sending")) return;
+    if (mode === "steer" && !body.dataset.run) return;
     const url = new URL(location.href);
-    url.pathname = url.pathname.replace(/\\/ui\\/(?:conversations|agents)\\/([^/]+)\\/?$/, (_, id) => "/conversations/" + id + "/runs/" + encodeURIComponent(body.dataset.run) + "/messages");
+    url.pathname = url.pathname.replace(/\\/ui\\/(?:conversations|agents)\\/([^/]+)\\/?$/, (_, id) =>
+      "/conversations/" + id + (mode === "steer" ? "/runs/" + encodeURIComponent(body.dataset.run) + "/messages" : "/runs"));
     url.search = "";
     form.classList.add("sending");
     hint.classList.remove("error");
     try {
       const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt }) });
       if (!response.ok) {
-        const code = (await response.json().catch(() => ({}))).code;
-        throw new Error(code === "not_running" ? "This run no longer takes messages. Send a follow-up once it has ended." : "Could not send the message (" + (code || response.status) + ").");
+        const error = await response.json().catch(() => ({}));
+        throw new Error(
+          error.code === "not_running" ? "This run no longer takes messages. Send it again as a follow-up once the run has ended."
+          : error.code === "busy" && error.reason === "locked" ? "Another run is going; this conversation can go on once it ends."
+          : error.code === "busy" && error.reason === "dirty" ? "A checkout has uncommitted changes on " + error.branch + ". Clean it up first."
+          : "Could not send the message (" + (error.code || response.status) + ")."
+        );
       }
       field.value = "";
       fit();
-      hint.textContent = defaultHint;
+      hint.innerHTML = mode === "steer" ? defaultHint : "Starting…";
     } catch (error) {
       hint.textContent = error.message;
       hint.classList.add("error");
@@ -1254,8 +1368,7 @@ const STYLE = `
   .spark { color: var(--accent); display: inline-flex; width: 20px; height: 20px; flex: none; }
   .spark svg { width: 100%; height: 100%; }
 
-  main { flex: 1; width: 100%; max-width: 768px; margin: 0 auto; padding: 24px 16px 96px; }
-  body[data-run] main { padding-bottom: 24px; }
+  main { flex: 1; width: 100%; max-width: 768px; margin: 0 auto; padding: 24px 16px; }
   .run { padding-top: 20px; }
   .run-label { text-align: center; font-size: 12px; color: var(--muted); margin: 8px 0 16px; }
   .status.running { color: var(--run); } .status.finished { color: var(--ok); } .status.failed { color: var(--err); } .status.cancelled { color: var(--muted); }
@@ -1339,17 +1452,39 @@ const STYLE = `
   .user-msg.steer { flex-direction: column; align-items: flex-end; gap: 4px; margin: 10px 0 12px; }
   .steer-note { font-size: 12px; color: var(--muted); }
 
-  /* Shown only while a run is going (the page then has data-run). */
-  .composer { display: none; position: sticky; bottom: 0; z-index: 2; max-width: 768px; margin: 0 auto; padding: 0 16px 16px; background: linear-gradient(transparent, var(--bg) 24px); }
-  body[data-run] .composer { display: block; }
+  /* Always shown: steers the running run, starts a follow-up, or says why neither is possible. */
+  .composer { position: sticky; bottom: 0; z-index: 2; max-width: 768px; margin: 0 auto; padding: 0 16px 16px; background: linear-gradient(transparent, var(--bg) 24px); }
   .composer-box { display: flex; align-items: flex-end; gap: 8px; background: var(--surface); border: 1px solid var(--border-strong); border-radius: 16px; padding: 8px 8px 8px 14px; box-shadow: 0 4px 20px rgba(0, 0, 0, .08); }
   .composer-box:focus-within { border-color: var(--accent); }
+  .composer[data-mode="off"] .composer-box { opacity: .55; box-shadow: none; }
   .composer textarea { flex: 1; min-width: 0; resize: none; border: 0; outline: 0; background: transparent; color: var(--text); font: 15px/1.5 var(--sans); padding: 4px 0; max-height: 200px; }
   .composer button { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border: 0; border-radius: 10px; background: var(--accent); color: #fff; cursor: pointer; }
+  .composer button:disabled { cursor: default; background: var(--muted); }
   .composer button .icon { width: 18px; height: 18px; }
   .composer.sending button { opacity: .5; cursor: progress; }
   .composer-hint { font-size: 12px; color: var(--muted); padding: 6px 4px 0; }
   .composer-hint.error { color: var(--err); }
+  .composer-hint code { font: 11.5px var(--mono); }
+
+  .workspace { margin: 0 8px 10px; padding: 10px 10px 6px; border-bottom: 1px solid var(--border); }
+  .ws-head { display: flex; align-items: center; gap: 8px; font-weight: 600; min-width: 0; }
+  .ws-status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .ws-head .elapsed { margin-left: auto; flex: none; font-weight: 500; font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .ws-tools { display: flex; gap: 12px; margin: 6px 0 2px 18px; font-size: 13px; }
+  .tool-link { display: inline-flex; align-items: center; gap: 4px; color: var(--text-2); }
+  .tool-link .icon { width: 14px; height: 14px; color: var(--muted); }
+  .checkouts { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+  .checkout { display: flex; flex-direction: column; gap: 1px; padding: 4px 6px; margin: 0 -6px; border-radius: 6px; min-width: 0; }
+  .checkout.running { background: var(--run-soft); }
+  .checkout-name, .checkout-branch { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .checkout-name { font-weight: 500; }
+  .checkout-name a { color: var(--text); }
+  .checkout-branch { color: var(--muted); font-size: 12.5px; }
+  .checkout-branch > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .checkout-branch code { font: 12px var(--mono); }
+  .checkout .icon { width: 13px; height: 13px; color: var(--muted); }
+  .checkout .flag { margin-left: auto; flex: none; font-size: 11.5px; font-weight: 600; color: var(--err); }
+  .dot.idle { background: var(--muted); opacity: .5; }
   .working { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 14px; color: var(--muted); min-width: 0; }
   .activity-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .working .elapsed, .working .total { flex: none; font-variant-numeric: tabular-nums; }

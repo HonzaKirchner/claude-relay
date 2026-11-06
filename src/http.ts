@@ -36,19 +36,19 @@ export function createHandler(runner: ConversationRunner, pages: PageOptions = {
     const started = performance.now();
     const live = UI_STREAM.exec(new URL(request.url ?? "/", "http://runner").pathname);
     if (live && request.method === "GET") {
-      stream(runner, live[1]!, request, response);
+      stream(runner, pages, live[1]!, request, response);
       logRequest(request, response.statusCode, since(started));
       return;
     }
     route(runner, pages, request)
       .catch((error: unknown): Reply => {
-        // One run at a time per checkout. `busy` is the code Rakazo knows; `reason` and the rest are
-        // additive: `locked` names the conversation whose run is going, `dirty` the branch the
-        // checkout is on with uncommitted changes to deal with by hand.
+        // One run at a time across the root. `busy` is the code Rakazo knows; `reason` and the rest
+        // are additive: `locked` names the conversation whose run is going, `dirty` the checkout
+        // with uncommitted changes to deal with by hand and the branch it is on.
         if (error instanceof ConversationBusy)
           return { status: 409, body: { code: "busy", reason: "locked", conversation: error.conversation } };
         if (error instanceof CheckoutDirty)
-          return { status: 409, body: { code: "busy", reason: "dirty", branch: error.branch } };
+          return { status: 409, body: { code: "busy", reason: "dirty", branch: error.branch, path: error.path } };
         if (error instanceof RunNotRunning) return { status: 409, body: { code: "not_running" } };
         // The repository is not cloned where it should be: someone has to do that in the workspace,
         // so Rakazo rightly gives the request up (`invalid`). `reason` and the rest are additive.
@@ -98,6 +98,7 @@ async function route(runner: ConversationRunner, pages: PageOptions, request: In
   const pathname = url.pathname;
   const method = request.method ?? "GET";
   if (pathname === "/health" && method === "GET") return { status: 200, body: { ok: true } };
+  if (pathname === "/workspace" && method === "GET") return { status: 200, body: await runner.workspace() };
   const conversation = CONVERSATION.exec(pathname);
   if (conversation && method === "PUT") {
     const body = launchRequest(await readJson(request));
@@ -118,13 +119,13 @@ async function route(runner: ConversationRunner, pages: PageOptions, request: In
   if (ui && method === "GET") {
     const transcript = await runner.transcript(ui[1]!);
     if (!transcript) return { status: 404, body: { code: "not_found" } };
-    return { status: 200, body: null, html: transcriptPage(transcript, runner.list(), pages) };
+    return { status: 200, body: null, html: transcriptPage(transcript, runner.list(), await runner.workspace(), pages) };
   }
   const uiList = UI_LIST.exec(pathname);
   if (uiList && method === "GET") {
     // Relative links: `/ui/conversations` needs `conversations/<id>`, `/ui/conversations/` needs `./<id>`.
     const hrefPrefix = uiList[2] ? "./" : `${uiList[1]}/`;
-    return { status: 200, body: null, html: conversationsPage(runner.list(), hrefPrefix, pages) };
+    return { status: 200, body: null, html: conversationsPage(runner.list(), await runner.workspace(), hrefPrefix, pages) };
   }
   return { status: 404, body: { code: "route_not_found" } };
 }
@@ -136,7 +137,7 @@ async function route(runner: ConversationRunner, pages: PageOptions, request: In
  * the page is out of date (a run started or ended), after which the stream ends. A page showing
  * no running run waits here for the next one to start.
  */
-function stream(runner: ConversationRunner, id: string, request: IncomingMessage, response: ServerResponse) {
+function stream(runner: ConversationRunner, pages: PageOptions, id: string, request: IncomingMessage, response: ServerResponse) {
   const conversation = runner.get(id);
   if (!conversation) {
     response.writeHead(404, { "content-type": "application/json" });
@@ -182,11 +183,17 @@ function stream(runner: ConversationRunner, id: string, request: IncomingMessage
 
   const liveRun = runner.liveRun(id);
   if (!pageRun) {
-    // The page shows no run going: it only needs to hear when one starts.
+    // The page shows no run going: it needs to hear when one starts, and when any run takes or
+    // gives back the root, since that changes what its message box can do.
     if (liveRun) return reload();
-    unsubscribe = runner.subscribe(id, (update) => {
+    const unsubscribeRun = runner.subscribe(id, (update) => {
       if (update.type === "start" || update.type === "end") reload();
     });
+    const unwatch = runner.watch(reload);
+    unsubscribe = () => {
+      unsubscribeRun();
+      unwatch();
+    };
   } else {
     if (!liveRun || liveRun.runId !== pageRun || !Number.isInteger(after) || after < 0 || after > liveRun.events.length || !Number.isInteger(messagesShown) || messagesShown < 0 || messagesShown > liveRun.messages.length)
       return reload();
@@ -225,9 +232,9 @@ function stream(runner: ConversationRunner, id: string, request: IncomingMessage
       }
     });
     const panels = async () => {
-      const transcript = await runner.transcript(id).catch(() => undefined);
+      const [transcript, workspace] = await Promise.all([runner.transcript(id), runner.workspace()]).catch(() => []);
       if (closed) return;
-      if (transcript) send("patch", { ops: sidePanels(transcript, runner.list()) });
+      if (transcript && workspace) send("patch", { ops: sidePanels(transcript, runner.list(), workspace, pages) });
       later(STREAM_PANELS_MS, panels);
     };
     later(STREAM_PANELS_MS, panels);
