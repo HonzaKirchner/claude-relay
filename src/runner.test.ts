@@ -660,6 +660,35 @@ describe("claude code runner", () => {
     });
   });
 
+  it("says whether a run could start, without starting one", async () => {
+    const availability = async (query = "") => (await call("GET", `/availability${query}`)).body;
+    // Idle, with every checkout clean: any run could start.
+    expect(await availability()).toEqual({ available: true });
+
+    // While a run is going, nothing could start anywhere, not even a follow-up of its own conversation.
+    const launched = await call("PUT", "/conversations/busy", { prompt: "hang\nmore" });
+    await claudeStarted(1);
+    const locked = { available: false, reason: "locked", conversation: "busy", title: "hang" };
+    expect(await availability()).toEqual(locked);
+    expect(await availability("?conversation=busy")).toEqual(locked);
+    await call("POST", `/conversations/busy/runs/${launched.body.runId}/cancel`);
+    expect(await availability()).toEqual({ available: true });
+
+    // Leftovers of a failed run block everything but that conversation's own follow-up.
+    await call("PUT", "/conversations/messy", { prompt: "dirty" });
+    await runner.idle();
+    const dirty = { available: false, reason: "dirty", name: "demo", path: checkout, branch: "agent/messy" };
+    expect(await availability()).toEqual(dirty);
+    expect(await availability("?conversation=busy")).toEqual(dirty);
+    expect(await availability("?conversation=messy")).toEqual({ available: true });
+    // The check itself changed nothing: no run was started, and the checkout is as it was.
+    expect(claudeCalls()).toHaveLength(2);
+    expect(git(checkout, "status", "--porcelain")).toContain("leftover.txt");
+
+    expect(await call("GET", "/availability?conversation=unknown")).toEqual({ status: 404, body: { code: "not_found" } });
+    expect((await call("GET", "/availability?conversation=bad%2Fid")).status).toBe(400);
+  }, 20_000); // Two runs and a fresh scan per check: about 6 s on a laptop.
+
   it("offers the page's message box for steering, a follow-up, or neither with the reason", async () => {
     const page = async (id: string) => (await fetch(`${base}/ui/conversations/${id}`)).text();
     await call("PUT", "/conversations/second", { prompt: "hi", repository: OTHER });

@@ -69,9 +69,25 @@ export interface Transcript {
 export type ComposerState =
   | { mode: "steer"; runId: string }
   | { mode: "reply" }
-  | { mode: "off"; reason: "locked"; conversation: string; title: string }
-  | { mode: "off"; reason: "dirty"; name: string; path: string; branch: string }
-  | { mode: "off"; reason: "no_checkout"; repository?: string };
+  | ({ mode: "off" } & Unavailable);
+
+/**
+ * Why a run could not start right now, as `acquire` would refuse it, with the details the
+ * refusal carries: for `locked` and `dirty` those of the `busy` response, for `no_checkout`
+ * those of the `invalid` one.
+ */
+export type Unavailable =
+  | { reason: "locked"; conversation: string; title: string }
+  | { reason: "dirty"; name: string; path: string; branch: string }
+  | { reason: "no_checkout"; path: string; repository?: string; found?: string };
+
+/** Whether the workspace could take a run right now, and if not, why (`GET /availability`). */
+export type Availability = { available: true } | ({ available: false } & Unavailable);
+
+/** What `availability` is asked about: a follow-up of `conversation`, or any run at all. */
+export interface AvailabilityQuery {
+  conversation?: string;
+}
 
 /** One line of the conversation list on the transcript page. */
 export interface ConversationSummary {
@@ -267,7 +283,7 @@ export class ConversationRunner {
   private readonly store: Store;
   private readonly conversations = new Map<string, Conversation>();
   /** The conversation whose run is going or being started: the one lock over the whole root. */
-  private current?: string;
+  private current?: Conversation;
   /** By conversation: the checkout its run works in, from `acquire` until the run ends. */
   private readonly checkouts = new Map<string, string>();
   /** The last scan of the checkouts, and when it was started; see `workspace`. */
@@ -358,11 +374,11 @@ export class ConversationRunner {
    */
   private async acquire(conversation: Conversation) {
     if (this.current) {
-      log.info("run refused, another run is going", { conversation: conversation.id, running: this.current });
-      throw new ConversationBusy(this.current);
+      log.info("run refused, another run is going", { conversation: conversation.id, running: this.current.id });
+      throw new ConversationBusy(this.current.id);
     }
     // Set before anything awaits, so a request arriving meanwhile is refused.
-    this.current = conversation.id;
+    this.current = conversation;
     this.changed();
     try {
       const checkout = await this.locate(conversation);
@@ -381,7 +397,7 @@ export class ConversationRunner {
   /** Gives the root back once the run has ended, or never started. */
   private release(conversation: Conversation) {
     this.checkouts.delete(conversation.id);
-    if (this.current !== conversation.id) return;
+    if (this.current !== conversation) return;
     this.current = undefined;
     this.changed();
   }
@@ -410,19 +426,12 @@ export class ConversationRunner {
    * for `WORKSPACE_TTL_MS` since the pages ask often.
    */
   async workspace(): Promise<Workspace> {
-    if (!this.scanned || Date.now() - this.scannedAt > WORKSPACE_TTL_MS) {
-      this.scannedAt = Date.now();
-      const scan = (this.scanned = this.scan());
-      scan.catch(() => {
-        if (this.scanned === scan) this.scanned = undefined;
-      });
-    }
-    const checkouts = await this.scanned;
+    const checkouts = await (this.scanned && Date.now() - this.scannedAt <= WORKSPACE_TTL_MS ? this.scanned : this.rescan());
     const byBranch = new Map<string, string>();
     for (const conversation of this.conversations.values())
       if (conversation.branch && conversation.repository)
         byBranch.set(`${repositoryKey(conversation.repository)}#${conversation.branch}`, conversation.id);
-    const running = this.current ? this.conversations.get(this.current) : undefined;
+    const running = this.current;
     const run = running?.runs.at(-1);
     return {
       ...(running && run
@@ -441,6 +450,55 @@ export class ConversationRunner {
         return conversation ? { ...checkout, conversation } : checkout;
       }),
     };
+  }
+
+  /**
+   * Whether a run could start right now, without starting one: a follow-up of `conversation`
+   * (in its repository, going on from its own leftovers), or, without one, any run at all, for
+   * which no checkout is looked for. Reads only, like `workspace`, but scans the checkouts
+   * afresh, since the answer is what `acquire` would say now. It is a moment's picture: the
+   * launch or follow-up itself is checked again and may still be refused. Undefined when the
+   * conversation is unknown.
+   */
+  async availability(query: AvailabilityQuery = {}): Promise<Availability | undefined> {
+    const conversation = query.conversation === undefined ? undefined : this.conversations.get(query.conversation);
+    if (query.conversation !== undefined && !conversation) return undefined;
+    const refusal = this.refusal(await this.rescan(), conversation?.repository, conversation);
+    return refusal ? { available: false, ...refusal } : { available: true };
+  }
+
+  /**
+   * Why a run could not start now, as `acquire` would refuse it, or undefined when it could:
+   * another run is going; `repository` is not checked out under the root (as `locate` looks for
+   * it); a checkout has uncommitted changes that are not `own`'s leftovers (in its checkout on
+   * its branch). Decided from `checkouts`, a scan of the root; no `repository` means no checkout
+   * is looked for.
+   */
+  private refusal(checkouts: Checkout[], repository?: string, own?: { branch?: string }): Unavailable | undefined {
+    if (this.current) return { reason: "locked", conversation: this.current.id, title: this.current.title };
+    const { root } = this.options;
+    let checkout: Checkout | undefined;
+    if (repository) {
+      const name = checkoutName(repository);
+      const dir = name ? path.join(root, name) : undefined;
+      const named = dir ? checkouts.find((item) => item.path === dir) : undefined;
+      const rootItself = named ? undefined : checkouts.find((item) => item.path === root);
+      checkout = [named, rootItself].find((item) => item && sameRepository(item.repository, repository));
+      if (!checkout) return { reason: "no_checkout", path: dir ?? root, repository, ...(named ? { found: named.repository } : {}) };
+    }
+    const dirty = checkouts.find((item) => item.dirty && !(own && item.path === checkout?.path && item.branch === own.branch));
+    if (dirty) return { reason: "dirty", name: dirty.name, path: dirty.path, branch: dirty.branch };
+    return undefined;
+  }
+
+  /** A fresh scan of the checkouts, which `workspace` then shares until it goes stale. */
+  private rescan(): Promise<Checkout[]> {
+    this.scannedAt = Date.now();
+    const scan = (this.scanned = this.scan());
+    scan.catch(() => {
+      if (this.scanned === scan) this.scanned = undefined;
+    });
+    return scan;
   }
 
   /**
@@ -586,18 +644,10 @@ export class ConversationRunner {
   private composer(conversation: Conversation, workspace: Workspace): ComposerState {
     const run = conversation.runs.at(-1);
     if (run?.status === "running") return { mode: "steer", runId: run.id };
-    if (workspace.running)
-      return { mode: "off", reason: "locked", conversation: workspace.running.conversation, title: workspace.running.title };
-    const { repository } = conversation;
-    // As `locate` picks it: the checkout named after the repository, else the root itself.
-    const own =
-      repository &&
-      (workspace.checkouts.find((item) => item.path !== this.options.root && sameRepository(item.repository, repository)) ??
-        workspace.checkouts.find((item) => item.path === this.options.root && sameRepository(item.repository, repository)));
-    if (!own) return { mode: "off", reason: "no_checkout", ...(repository ? { repository } : {}) };
-    const dirty = workspace.checkouts.find((item) => item.dirty && !(item.path === own.path && item.branch === conversation.branch));
-    if (dirty) return { mode: "off", reason: "dirty", name: dirty.name, path: dirty.path, branch: dirty.branch };
-    return { mode: "reply" };
+    // Every conversation records its repository on its first run; one without never had one.
+    if (!conversation.repository) return { mode: "off", reason: "no_checkout", path: this.options.root };
+    const refusal = this.refusal(workspace.checkouts, conversation.repository, conversation);
+    return refusal ? { mode: "off", ...refusal } : { mode: "reply" };
   }
 
   async reply(id: string, request: PromptRequest): Promise<ConversationView | undefined> {

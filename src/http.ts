@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { ConversationView, ConversationRunner, Image, LaunchRequest, PromptRequest, RunMessage } from "./runner.ts";
+import type { AvailabilityQuery, ConversationView, ConversationRunner, Image, LaunchRequest, PromptRequest, RunMessage } from "./runner.ts";
 import { log, since } from "./log.ts";
 import { CheckoutDirty, CheckoutMissing, ConversationBusy, RunNotRunning, checkoutName } from "./runner.ts";
 import type { LiveOp, PageOptions } from "./ui.ts";
@@ -8,6 +8,7 @@ import { LiveRunRenderer, conversationsPage, sidePanels, transcriptPage } from "
 const MAX_BODY_BYTES = 128 * 1024 * 1024;
 const MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 const ID = "[A-Za-z0-9_-]{1,128}";
+const ID_ONLY = new RegExp(`^${ID}$`);
 // `/conversations` is canonical. `/agents` is Rakazo's name for a conversation and stays
 // as an alias, because the fork's Coder adapter calls those paths.
 const BASE = "/(?:conversations|agents)";
@@ -99,6 +100,10 @@ async function route(runner: ConversationRunner, pages: PageOptions, request: In
   const method = request.method ?? "GET";
   if (pathname === "/health" && method === "GET") return { status: 200, body: { ok: true } };
   if (pathname === "/workspace" && method === "GET") return { status: 200, body: await runner.workspace() };
+  if (pathname === "/availability" && method === "GET") {
+    const availability = await runner.availability(availabilityQuery(url.searchParams));
+    return availability ? { status: 200, body: availability } : { status: 404, body: { code: "not_found" } };
+  }
   const conversation = CONVERSATION.exec(pathname);
   if (conversation && method === "PUT") {
     const body = launchRequest(await readJson(request));
@@ -280,6 +285,14 @@ function launchRequest(value: unknown): LaunchRequest {
     request.baseBranch = baseBranch;
   }
   return request;
+}
+
+/** `GET /availability?conversation=<id>`: the conversation a follow-up would be of, if any. */
+function availabilityQuery(params: URLSearchParams): AvailabilityQuery {
+  const conversation = params.get("conversation");
+  if (conversation === null) return {};
+  if (!ID_ONLY.test(conversation)) throw new InvalidRequest();
+  return { conversation };
 }
 
 /** A plain branch name: what `git check-ref-format --branch` allows, without the odd corners, and never an option. */
