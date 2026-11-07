@@ -6,7 +6,7 @@ import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import pg from "pg";
-import { afterEach, beforeEach, describe, expect, inject, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, inject, it, vi } from "vitest";
 import { Store } from "./db.ts";
 import { createHandler } from "./http.ts";
 import type { ConversationView } from "./runner.ts";
@@ -308,7 +308,7 @@ async function call(method: string, pathname: string, body?: unknown) {
     headers: { "content-type": "application/json" },
     body: sent === undefined ? undefined : JSON.stringify(sent),
   });
-  const json = (await response.json()) as Partial<ConversationView> & { code?: string };
+  const json = (await response.json()) as Partial<ConversationView> & { code?: string; detail?: string };
   return { status: response.status, body: json };
 }
 
@@ -634,8 +634,10 @@ describe("claude code runner", () => {
   });
 
   it("describes the workspace: the run going and each checkout's branch", async () => {
-    // The service's own checkout is not part of the platform, even when it lives under the root.
+    // The service's own checkout is not part of the platform, even when it lives under the root,
+    // and neither is the dev sandbox's own repository.
     symlinkSync(process.cwd(), path.join(root, "claude-relay"));
+    git(root, "clone", "--quiet", otherOrigin, "apify-dev-sandbox");
     const idle = await (await fetch(`${base}/workspace`)).json();
     expect(idle).toEqual({
       checkouts: [
@@ -1046,14 +1048,54 @@ describe("claude code runner", () => {
   });
 
   it("validates requests and reports unknown conversations", async () => {
-    expect((await call("PUT", "/conversations/bad", { prompt: "" })).status).toBe(400);
-    expect(
-      (await call("PUT", "/conversations/bad", { prompt: "x", repository: "file:///etc" })).status,
-    ).toBe(400);
+    // A rejected request says what is wrong with it (`detail`), since Rakazo shows nothing of it.
+    const rejected = async (body: unknown) => {
+      const response = await call("PUT", "/conversations/bad", body);
+      expect(response.status).toBe(400);
+      expect(response.body.code).toBe("invalid");
+      return response.body.detail;
+    };
+    expect(await rejected({ prompt: "" })).toBe("prompt is blank");
+    expect(await rejected({})).toBe("prompt is missing, not a string");
+    expect(await rejected({ prompt: 7 })).toBe("prompt is number 7, not a string");
+    expect(await rejected({ prompt: "x", repository: "file:///etc" })).toBe('repository "file:///etc" is not an https URL');
+    expect(await rejected({ prompt: "x", repository: "not a url" })).toBe('repository "not a url" is not a URL');
     // A repository URL has to name a directory under the root.
-    expect((await call("PUT", "/conversations/bad", { prompt: "x", repository: "https://github.com/" })).status).toBe(400);
-    expect((await call("PUT", "/conversations/bad", { prompt: "x", repository: "https://github.com/a/.." })).status).toBe(400);
+    expect(await rejected({ prompt: "x", repository: "https://github.com/" })).toBe('repository "https://github.com/" does not end in a repository name');
+    expect(await rejected({ prompt: "x", repository: "https://github.com/a/.." })).toBe('repository "https://github.com/a/.." does not end in a repository name');
+    expect(await rejected({ prompt: "x", openPr: "yes" })).toBe("openPr is a string, not a boolean");
+    expect(await rejected({ prompt: "x", baseBranch: "a b" })).toBe('baseBranch "a b" is not a branch name');
+    expect(await rejected({ prompt: "x", images: [{ data: "AA==", mimeType: "image/bmp" }] })).toBe(
+      "images[0].mimeType is a string, not one of image/png, image/jpeg, image/gif, image/webp",
+    );
+    expect(await rejected({ prompt: "x", images: [{}] })).toBe("images[0] has neither url nor data");
     expect((await call("GET", "/conversations/missing")).body).toEqual({ code: "not_found" });
     expect((await call("GET", "/conversations/bad%2F..")).status).toBe(404);
+  });
+
+  it("answers internal when a request fails outside the routes, and stays up", async () => {
+    await call("PUT", "/conversations/stable", { prompt: "hi" });
+    await finished("stable");
+    // The stream handler runs before the routes: a failure before its headers go out is still a JSON error.
+    vi.spyOn(runner, "get").mockImplementationOnce(() => {
+      throw new Error("boom");
+    });
+    expect((await call("GET", "/ui/conversations/stable/stream")).body).toEqual({ code: "internal" });
+    // Once the stream is open, a failure ends it (the page reconnects) and touches nothing else.
+    vi.spyOn(runner, "liveRun").mockImplementationOnce(() => {
+      throw new Error("boom");
+    });
+    const broken = await openStream("/ui/conversations/stable/stream");
+    expect(broken.response.status).toBe(200);
+    expect((await broken.next())?.event).toBe("ready");
+    expect(await broken.next()).toBeUndefined();
+    // A reply that cannot be written out is an error too, not a dropped connection.
+    vi.spyOn(runner, "workspace").mockResolvedValueOnce({ cost: 1n } as never);
+    expect(await call("GET", "/workspace")).toEqual({ status: 500, body: { code: "internal" } });
+    vi.restoreAllMocks();
+    expect((await call("GET", "/health")).body).toEqual({ ok: true });
+    const again = await openStream("/ui/conversations/stable/stream");
+    expect((await again.next())?.event).toBe("ready");
+    await again.close();
   });
 });

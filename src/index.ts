@@ -69,6 +69,16 @@ try {
   process.exit(1);
 }
 
+// A slip anywhere would otherwise take the whole service down, and Rakazo would read the dropped
+// connection as "workspace not reachable" and start the workspace. Logged and survived instead;
+// every request path answers its own errors, so this is the last resort, not the normal route.
+process.on("uncaughtException", (error) => {
+  log.error("uncaught exception", { error: error.stack ?? error.message });
+});
+process.on("unhandledRejection", (reason) => {
+  log.error("unhandled rejection", { error: reason instanceof Error ? (reason.stack ?? reason.message) : String(reason) });
+});
+
 const port = Number(process.env.PORT || 4115);
 const server = createServer(createHandler(runner, pages)).listen(port, "127.0.0.1", () => {
   log.info(`claude-code-runner listening on 127.0.0.1:${port}`);

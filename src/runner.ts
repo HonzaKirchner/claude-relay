@@ -265,6 +265,15 @@ const WORKSPACE_TTL_MS = 3_000;
 const OWN_CHECKOUT = realpath(path.resolve(import.meta.dirname, "..")).catch(() => undefined);
 
 /**
+ * Checkouts under the root, by directory name, that are no part of the platform: left out of the
+ * workspace, so never listed, switched, or counted as dirty. This service and the dev sandbox's
+ * own repository sit beside the platform's checkouts in a Coder workspace, but they are the
+ * workspace's tooling, not something a conversation works on. `OWN_CHECKOUT` catches the
+ * service by path as well, in case it runs from a directory of another name.
+ */
+const IGNORED_CHECKOUTS = new Set(["claude-relay", "apify-dev-sandbox"]);
+
+/**
  * Runs one headless Claude Code session per conversation, in the checkout of the conversation's
  * repository under `root`, each on its own branch, and publishes the result as that branch (and
  * optionally a pull request).
@@ -503,12 +512,15 @@ export class ConversationRunner {
 
   /**
    * Every git checkout under the root (and the root itself when it is one), freshly inspected;
-   * all but the service's own (`OWN_CHECKOUT`).
+   * all but the service's own (`OWN_CHECKOUT`) and the ignored ones (`IGNORED_CHECKOUTS`).
    */
   private async scan(): Promise<Checkout[]> {
     const { root } = this.options;
     const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
-    const names = entries.filter((entry) => !entry.name.startsWith(".")).map((entry) => entry.name).sort();
+    const names = entries
+      .map((entry) => entry.name)
+      .filter((name) => !name.startsWith(".") && !IGNORED_CHECKOUTS.has(name))
+      .sort();
     const dirs = [root, ...names.map((name) => path.join(root, name))];
     const own = await OWN_CHECKOUT;
     const found = await Promise.all(
