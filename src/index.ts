@@ -1,77 +1,49 @@
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { Store } from "./db.ts";
 import { createHandler } from "./http.ts";
 import { log } from "./log.ts";
 import { ConversationRunner } from "./runner.ts";
-import { terminalUrlOf } from "./ui.ts";
-
-const connectionString = process.env.DB_CONNECTION_STRING;
-if (!connectionString) {
-  log.error("DB_CONNECTION_STRING is not set; conversations are stored only in PostgreSQL, so the service cannot start");
-  process.exit(1);
-}
+import { SecretStore } from "./secrets.ts";
+import { Store } from "./store.ts";
 
 const options = {
-  // Holds the checkouts Claude works in, one per repository (or is one checkout itself); all
-  // conversation data is in the database.
+  // Holds the checkouts Claude works in, one per repository (or is one checkout itself).
   root: path.resolve(process.env.RUNNER_WORKDIR || path.join(os.homedir(), "src")),
   baseBranch: process.env.RUNNER_BASE_BRANCH || undefined,
   claudeCommand: process.env.CLAUDE_COMMAND || "claude",
   claudeModel: process.env.CLAUDE_MODEL || undefined,
   ghCommand: process.env.GH_COMMAND || "gh",
-  // Base URL of this service in a browser, e.g. https://coder.example.com/@me/ws/apps/claude.
-  // When set, every ConversationView carries `url`, a link to the conversation page.
-  publicUrl: process.env.APP_URL || undefined,
 };
-// Where the pages' links go: the Rakazo app the conversations are launched from, the console
-// the workspace serves from its checkouts, and the workspace's terminal (Coder's, derived from
-// APP_URL unless TERMINAL_URL says otherwise) and VS Code for cleaning up a checkout by hand.
-const pages = {
-  rakazoUrl: process.env.RAKAZO_URL || "https://rakazo.jankirchner.cz/app",
-  consoleUrl: process.env.CONSOLE_URL || undefined,
-  terminalUrl: process.env.TERMINAL_URL || terminalUrlOf(options.publicUrl),
-  vscodeUrl: process.env.VSCODE_URL || undefined,
-};
+// What the service remembers across a restart, and the secrets it is handed: both on the
+// workspace's persistent disk, outside every checkout.
+const stateDir = path.resolve(process.env.RUNNER_STATE_DIR || path.join(os.homedir(), ".claude-relay"));
+const secretsDir = path.resolve(process.env.RUNNER_SECRETS_DIR || path.join(os.homedir(), ".apix"));
 log.info("starting", {
   root: options.root,
+  state: stateDir,
   baseBranch: options.baseBranch ?? "the origin's default branch",
   claude: options.claudeCommand,
   model: options.claudeModel ?? "Claude Code's default",
   gh: options.ghCommand,
-  appUrl: options.publicUrl ?? "unset (responses carry no url)",
-  rakazoUrl: pages.rakazoUrl,
-  consoleUrl: pages.consoleUrl ?? "unset (no console link)",
-  terminalUrl: pages.terminalUrl ?? "unset (no terminal link)",
-  vscodeUrl: pages.vscodeUrl ?? "unset (no VS Code link)",
   logLevel: process.env.LOG_LEVEL || "info",
 });
 
-const store = new Store(connectionString);
-try {
-  await store.migrate();
-} catch (error) {
-  log.error("database unavailable, cannot start", {
-    error: error instanceof Error ? error.message : String(error),
-  });
-  await store.close().catch(() => undefined);
-  process.exit(1);
-}
-log.info("database ready");
-
+const store = new Store(stateDir);
+const secrets = new SecretStore(secretsDir);
 const runner = new ConversationRunner({ ...options, store });
 try {
+  await store.prepare();
+  await secrets.load();
   await runner.load();
 } catch (error) {
   log.error("cannot start", { error: error instanceof Error ? error.message : String(error) });
-  await store.close().catch(() => undefined);
   process.exit(1);
 }
 
-// A slip anywhere would otherwise take the whole service down, and Rakazo would read the dropped
-// connection as "workspace not reachable" and start the workspace. Logged and survived instead;
-// every request path answers its own errors, so this is the last resort, not the normal route.
+// A slip anywhere would otherwise take the whole service down, and its caller would read the
+// dropped connection as "workspace not reachable". Logged and survived instead; every request
+// path answers its own errors, so this is the last resort, not the normal route.
 process.on("uncaughtException", (error) => {
   log.error("uncaught exception", { error: error.stack ?? error.message });
 });
@@ -80,7 +52,7 @@ process.on("unhandledRejection", (reason) => {
 });
 
 const port = Number(process.env.PORT || 4115);
-const server = createServer(createHandler(runner, pages)).listen(port, "127.0.0.1", () => {
+const server = createServer(createHandler(runner, secrets)).listen(port, "127.0.0.1", () => {
   log.info(`claude-code-runner listening on 127.0.0.1:${port}`);
 });
 
@@ -89,6 +61,6 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     log.info("shutting down", { signal });
     server.close();
     // Pending event writes would otherwise be lost.
-    void store.close().finally(() => process.exit(0));
+    void store.flush().finally(() => process.exit(0));
   });
 }

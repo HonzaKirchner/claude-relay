@@ -9,22 +9,13 @@
   },
   "scripts": {
     "start": "node --env-file-if-exists=.env src/index.ts",
-    "dev": "npm run db:start && node --watch --env-file-if-exists=.env src/index.ts",
+    "dev": "node --watch --env-file-if-exists=.env src/index.ts",
     "check": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
-    "db:start": "node --env-file-if-exists=.env scripts/db.ts start",
-    "db:stop": "node --env-file-if-exists=.env scripts/db.ts stop",
-    "db:reset": "node --env-file-if-exists=.env scripts/db.ts reset",
-    "db:init": "node --env-file-if-exists=.env scripts/db-init.ts",
-    "db:seed": "node --env-file-if-exists=.env scripts/seed.ts",
-    "db:import": "node --env-file-if-exists=.env scripts/import-files.ts"
-  },
-  "dependencies": {
-    "pg": "^8.16.3"
+    "db:init": "node scripts/db-init.ts"
   },
   "devDependencies": {
     "@types/node": "^22.18.0",
-    "@types/pg": "^8.15.6",
     "typescript": "7.0.2",
     "vitest": "4.1.12"
   }

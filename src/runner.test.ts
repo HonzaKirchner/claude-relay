@@ -1,17 +1,16 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import type { Server } from "node:http";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
-import pg from "pg";
-import { afterEach, beforeEach, describe, expect, inject, it, vi } from "vitest";
-import { Store } from "./db.ts";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createHandler } from "./http.ts";
-import type { ConversationView } from "./runner.ts";
-import { ConversationRunner } from "./runner.ts";
-import { terminalUrlOf } from "./ui.ts";
+import type { ConversationView, Transcript } from "./runner.ts";
+import { ConversationRunner, NO_REPOSITORY } from "./runner.ts";
+import { SecretStore } from "./secrets.ts";
+import { Store } from "./store.ts";
 
 // Quiet by default; run `LOG_LEVEL=info npm test` to see the service's log.
 process.env.LOG_LEVEL ??= "silent";
@@ -117,6 +116,11 @@ let dir: string;
 let server: Server;
 let runner: ConversationRunner;
 let store: Store;
+/** Where the service keeps what it remembers, and the secrets it is handed. */
+let state: string;
+let secretsDir: string;
+/** Stands in for the service's own environment, which the secrets go into. */
+let secretEnv: NodeJS.ProcessEnv;
 let base: string;
 /** The bare origins of the two repositories. */
 let origin: string;
@@ -152,15 +156,14 @@ const identity = {
 };
 
 interface StartOptions {
-  publicUrl?: string;
   baseBranch?: string;
   claudeModel?: string;
   root?: string;
 }
 
 async function start(options: StartOptions = {}) {
-  store = new Store(inject("databaseUrl"));
-  await store.migrate();
+  store = new Store(state);
+  await store.prepare();
   runner = new ConversationRunner({
     store,
     root,
@@ -182,12 +185,15 @@ async function start(options: StartOptions = {}) {
     },
   });
   await runner.load();
-  server = createServer(createHandler(runner, { rakazoUrl: "https://rakazo.example.com/app" }));
+  secretEnv = {};
+  const secrets = new SecretStore(secretsDir, secretEnv);
+  await secrets.load();
+  server = createServer(createHandler(runner, secrets));
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
 
-/** Like a service restart: everything the new runner knows comes from the database. */
+/** Like a service restart: everything the new runner knows comes from its files. */
 async function restart(options: StartOptions = {}) {
   await stop();
   await start(options);
@@ -217,56 +223,16 @@ function repository(name: string, url: string) {
 async function stop() {
   await runner.idle();
   await new Promise((resolve) => server.close(resolve));
-  await store.close();
 }
 
-/** Runs SQL against the test database directly. */
-async function sql(text: string, values: unknown[] = []) {
-  const client = new pg.Client({ connectionString: inject("databaseUrl") });
-  await client.connect();
-  try {
-    return (await client.query(text, values)).rows;
-  } finally {
-    await client.end();
-  }
+/** What the service keeps of a conversation, read straight from its file. */
+function kept(id: string) {
+  return JSON.parse(readFileSync(path.join(state, "conversations", `${id}.json`), "utf8"));
 }
 
-interface Message {
-  event: string;
-  data: { seq?: number; messages?: number; ops?: Array<{ op: string; id?: string; target?: string; html: string }> };
-}
-
-/** Opens the page's event stream; `next` resolves with each message in turn. */
-async function openStream(pathname: string) {
-  const response = await fetch(`${base}${pathname}`);
-  const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader();
-  let buffered = "";
-  return {
-    response,
-    async next(): Promise<Message | undefined> {
-      for (;;) {
-        const end = buffered.indexOf("\n\n");
-        if (end >= 0) {
-          const frame = buffered.slice(0, end);
-          buffered = buffered.slice(end + 2);
-          const field = (name: string) => frame.split("\n").find((line) => line.startsWith(`${name}: `))?.slice(name.length + 2);
-          return { event: field("event")!, data: JSON.parse(field("data") ?? "{}") };
-        }
-        const { value, done } = await reader.read();
-        if (done) return undefined;
-        buffered += value;
-      }
-    },
-    /** Reads messages until one matches. */
-    async until(match: (message: Message) => boolean): Promise<Message> {
-      for (;;) {
-        const message = await this.next();
-        if (!message) throw new Error("stream ended");
-        if (match(message)) return message;
-      }
-    },
-    close: () => reader.cancel(),
-  };
+/** The events the service keeps of a run, read straight from its file. */
+function eventsOf(runId: string): Array<{ at: string; event: Record<string, any> }> {
+  return readFileSync(path.join(state, "events", `${runId}.jsonl`), "utf8").trim().split("\n").map((line) => JSON.parse(line));
 }
 
 /** Polls until the conversation's latest run has ended; `runner.idle()` would wait for every run. */
@@ -327,11 +293,8 @@ beforeEach(async () => {
   git(demo.seed, "push", origin, "release");
   otherOrigin = repository("other", OTHER).bare;
   other = path.join(root, "other");
-  // Applies the schema, then every test starts from empty tables.
-  const setup = new Store(inject("databaseUrl"));
-  await setup.migrate();
-  await setup.close();
-  await sql("TRUNCATE conversations, runs, run_messages, events, tool_calls");
+  state = path.join(dir, "state");
+  secretsDir = path.join(dir, "secrets");
   await start();
 });
 
@@ -341,49 +304,6 @@ afterEach(async () => {
 });
 
 describe("claude code runner", () => {
-  it("links each run to its conversation page when APP_URL is set", async () => {
-    expect((await call("PUT", "/conversations/plain", { prompt: "hi" })).body.url).toBeUndefined();
-    await restart({ publicUrl: "https://coder.example.com/@me/ws/apps/claude/" });
-    const launched = await call("PUT", "/conversations/linked", { prompt: "Say <hi>" });
-    expect(launched.body.url).toBe(
-      `https://coder.example.com/@me/ws/apps/claude/ui/conversations/linked`,
-    );
-    await runner.idle();
-    const page = await fetch(`${base}/ui/conversations/linked`);
-    expect(page.status).toBe(200);
-    expect(page.headers.get("content-type")).toContain("text/html");
-    const html = await page.text();
-    expect(html).toContain("Say &#60;hi&#62;");
-    expect(html).toContain("finished");
-    // The left sidebar lists every conversation, the right one sums this one up.
-    expect(html).toContain('href="./plain"');
-    // Its head names the service and links back to Rakazo.
-    expect(html).toContain("Rakazo code");
-    expect(html).toContain('href="https://rakazo.example.com/app"');
-    // Open, and its branch is what the checkout is on.
-    expect(html).toContain('href="./linked" class="current checked-out"');
-    expect(html).toContain("By model");
-    expect(html).toContain("Opus 5.5");
-    expect(html).toContain("$0.25");
-    expect((await call("GET", "/ui/conversations/missing")).body.code).toBe("not_found");
-    expect((await fetch(`${base}/ui/agents/linked`)).status).toBe(200);
-    // Links handed out before the run id was dropped still open the page.
-    expect((await fetch(`${base}/ui/conversations/linked?run=old`)).status).toBe(200);
-
-    // With no id, the page is the conversation list; links resolve against the URL served.
-    const list = await fetch(`${base}/ui/conversations`);
-    expect(list.status).toBe(200);
-    expect(list.headers.get("content-type")).toContain("text/html");
-    const listHtml = await list.text();
-    expect(listHtml).toContain('href="conversations/plain"');
-    expect(listHtml).toContain('href="conversations/linked"');
-    expect(listHtml).not.toContain('class="current"');
-    expect(listHtml).toContain("<title>Rakazo code</title>");
-    expect(listHtml).toContain('href="https://rakazo.example.com/app"');
-    expect(await (await fetch(`${base}/ui/conversations/`)).text()).toContain('href="./linked"');
-    expect(await (await fetch(`${base}/ui/agents`)).text()).toContain('href="agents/linked"');
-  });
-
   it("launches idempotently, pushes the branch and opens one pull request", async () => {
     const request = { prompt: "Add a file\nwith details", repository: REPOSITORY, openPr: true };
     const first = await call("PUT", "/agents/agent-1", request);
@@ -401,10 +321,6 @@ describe("claude code runner", () => {
       summary: "Done: Add a file",
     });
     expect(git(origin, "log", "--format=%s", "agent/agent-1")).toContain("Add a file");
-    // The pushed branch links to the branch on GitHub.
-    expect(await (await fetch(`${base}/ui/conversations/agent-1`)).text()).toContain(
-      `<a href="${REPOSITORY}/tree/agent/agent-1" target="_blank" rel="noopener"><code>agent/agent-1</code></a>`,
-    );
 
     const followup =await call("POST", "/agents/agent-1/runs", { prompt: "And another" });
     expect(followup.body.runId).not.toBe(first.body.runId);
@@ -489,7 +405,7 @@ describe("claude code runner", () => {
     });
     expect(filesOn("agent/other-2", otherOrigin)).toEqual(["README.md", expect.stringMatching(/^change-/)]);
     expect(git(other, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/other-2");
-    expect(await sql("SELECT repository FROM conversations WHERE id = 'other-2'")).toEqual([{ repository: "https://github.com/Example/other" }]);
+    expect(kept("other-2").repository).toBe("https://github.com/Example/other");
     // The run put demo's checkout back on its default branch: the platform is other-2's work on top of the defaults.
     expect(git(checkout, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("main");
     expect(() => git(origin, "rev-parse", "--verify", "agent/other-2")).toThrow();
@@ -515,6 +431,53 @@ describe("claude code runner", () => {
     expect(git(other, "log", "--format=%s", "-1").trim()).toBe("local");
     expect(git(checkout, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/demo-1");
   }, 20_000); // Five runs and a few dozen git commands: about 6 s on a laptop.
+
+  it("runs a launch that names no repository in the root, on no branch, publishing nothing", async () => {
+    // A conversation in a checkout leaves it on its branch: the picture a task without one keeps.
+    await call("PUT", "/conversations/before", { prompt: "First" });
+    await runner.idle();
+    const pushed = git(origin, "for-each-ref", "--format=%(refname)");
+
+    const launched = await call("PUT", "/conversations/none", { prompt: "How are you?", repository: NO_REPOSITORY });
+    expect(launched).toMatchObject({ status: 200, body: { status: "running" } });
+    await runner.idle();
+    const view = (await call("GET", "/conversations/none")).body;
+    expect(view).toMatchObject({ status: "finished", summary: "Done: How are you?" });
+    expect(view).not.toHaveProperty("branch");
+    expect(view).not.toHaveProperty("prUrl");
+
+    // Claude ran in the root itself, and was told the task has no repository.
+    expect(readdirSync(root).some((name) => name.startsWith("change-"))).toBe(true);
+    const note = claudeCalls().at(-1)!;
+    expect(note[note.indexOf("--append-system-prompt") + 1]).toContain("names no repository");
+    // No checkout was switched, and nothing was committed or pushed.
+    expect(git(checkout, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/before");
+    expect(git(other, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("main");
+    expect(git(checkout, "status", "--porcelain")).toBe("");
+    expect(git(origin, "for-each-ref", "--format=%(refname)")).toBe(pushed);
+
+    // It is listed and read without a repository or a branch, and can be followed up.
+    const transcript = (await call("GET", "/conversations/none/transcript")).body as unknown as Transcript;
+    expect(transcript).toMatchObject({ pushed: false, composer: { mode: "reply" } });
+    expect(transcript).not.toHaveProperty("repository");
+    expect(transcript).not.toHaveProperty("branch");
+    expect((await call("GET", "/availability?conversation=none")).body).toEqual({ available: true });
+    expect((await call("POST", "/conversations/none/runs", { prompt: "And now?" })).status).toBe(200);
+    await runner.idle();
+    expect((await call("GET", "/conversations/none")).body).toMatchObject({ status: "finished", summary: "Done: And now?" });
+    expect(claudeCalls().at(-1)).toContain("--resume");
+
+    // It survives a restart as what it is.
+    await restart();
+    expect(((await call("GET", "/conversations/none/transcript")).body as unknown as Transcript).composer).toEqual({ mode: "reply" });
+
+    // The one run at a time, and a dirty checkout, hold for it as for any other.
+    writeFileSync(path.join(other, "notes.txt"), "by hand\n");
+    expect(await call("PUT", "/conversations/blocked", { prompt: "hi", repository: NO_REPOSITORY })).toEqual({
+      status: 409,
+      body: { code: "busy", reason: "dirty", branch: "main", path: other },
+    });
+  });
 
   it("refuses a launch for a repository that is not checked out under the root", async () => {
     expect(await call("PUT", "/conversations/missing", { prompt: "hi", repository: "https://github.com/example/missing.git" })).toEqual({
@@ -572,10 +535,7 @@ describe("claude code runner", () => {
     await runner.idle();
     await call("PUT", "/conversations/named", { prompt: "Named" });
     await runner.idle();
-    expect(await sql("SELECT id, repository, pushed FROM conversations ORDER BY id")).toEqual([
-      { id: "bare", repository: REPOSITORY, pushed: true },
-      { id: "named", repository: REPOSITORY, pushed: true },
-    ]);
+    for (const id of ["bare", "named"]) expect(kept(id)).toMatchObject({ id, repository: REPOSITORY, pushed: true });
     expect(filesOn("agent/bare")).toHaveLength(2);
     expect(git(checkout, "rev-parse", "--abbrev-ref", "HEAD").trim()).toBe("agent/named");
     expect((await call("PUT", "/conversations/elsewhere", { prompt: "hi", repository: OTHER })).body).toEqual({
@@ -662,6 +622,38 @@ describe("claude code runner", () => {
     });
   });
 
+  it("lists the conversations, most recently active first", async () => {
+    expect(await call("GET", "/conversations")).toEqual({ status: 200, body: { conversations: [] } });
+    await call("PUT", "/conversations/first", { prompt: "one\nmore" });
+    await finished("first");
+    await call("PUT", "/conversations/second", { prompt: "two" });
+    await finished("second");
+    const summary = (id: string, title: string) => ({ id, title, status: "finished", runCount: 1, repository: REPOSITORY, branch: `agent/${id}`, updatedAt: expect.any(String) });
+    const listed = await call("GET", "/conversations");
+    expect(listed).toEqual({ status: 200, body: { conversations: [summary("second", "two"), summary("first", "one")] } });
+    expect(await call("GET", "/agents")).toEqual(listed);
+  });
+
+  it("gives a conversation's transcript: every run with its events, and what the message box can do", async () => {
+    expect(await call("GET", "/conversations/none/transcript")).toEqual({ status: 404, body: { code: "not_found" } });
+    await call("PUT", "/conversations/first", { prompt: "one\nmore" });
+    await finished("first");
+    const { status, body: view } = await call("GET", "/conversations/first/transcript");
+    const body = view as unknown as Transcript;
+    expect(status).toBe(200);
+    expect(body).toMatchObject({
+      id: "first",
+      title: "one",
+      repository: REPOSITORY,
+      branch: "agent/first",
+      runs: [{ seq: 1, status: "finished", prompt: "one\nmore", startedAt: expect.any(String), firstEvent: 0 }],
+      composer: { mode: "reply" },
+    });
+    expect(body.runs[0]!.events.length).toBeGreaterThan(0);
+    expect(body.runs[0]!.events[0]).toEqual({ at: expect.any(String), event: expect.any(Object) });
+    expect(await call("GET", "/agents/first/transcript")).toEqual({ status, body: view });
+  });
+
   it("says whether a run could start, without starting one", async () => {
     const availability = async (query = "") => (await call("GET", `/availability${query}`)).body;
     // Idle, with every checkout clean: any run could start.
@@ -691,58 +683,23 @@ describe("claude code runner", () => {
     expect((await call("GET", "/availability?conversation=bad%2Fid")).status).toBe(400);
   }, 20_000); // Two runs and a fresh scan per check: about 6 s on a laptop.
 
-  it("offers the page's message box for steering, a follow-up, or neither with the reason", async () => {
-    const page = async (id: string) => (await fetch(`${base}/ui/conversations/${id}`)).text();
+  it("says what a conversation's message box can do: steer, follow up, or neither with the reason", async () => {
+    const composer = async (id: string) => ((await call("GET", `/conversations/${id}/transcript`)).body as unknown as Transcript).composer;
     await call("PUT", "/conversations/second", { prompt: "hi", repository: OTHER });
     await runner.idle();
     const launched = await call("PUT", "/conversations/first", { prompt: "hang" });
-    // The running conversation's page steers it; another conversation's page waits for it.
-    expect(await page("first")).toContain('<form class="composer" id="composer" data-mode="steer"');
-    let html = await page("second");
-    expect(html).toContain('data-mode="off"');
-    expect(html).toContain('<textarea name="prompt" rows="1" maxlength="100000" placeholder="Not available right now" aria-label="Message to Claude" disabled>');
-    expect(html).toContain('Claude is working on <a href="./first">hang</a>.');
-    // The workspace section's state links to the running conversation, and marks the checkout on its branch.
-    expect(html).toContain('<a class="ws-task" href="./first" title="hang">');
-    expect(html).toContain('<li class="checkout running" title="');
-    // The list page shows the same workspace section.
-    expect(await (await fetch(`${base}/ui/conversations`)).text()).toContain('<a class="ws-task" href="conversations/first" title="hang">');
+    // The running conversation is steered; another one waits for it.
+    expect(await composer("first")).toEqual({ mode: "steer", runId: launched.body.runId });
+    expect(await composer("second")).toEqual({ mode: "off", reason: "locked", conversation: "first", title: "hang" });
     await call("POST", `/conversations/first/runs/${launched.body.runId}/cancel`);
-    // The runner is idle: both pages offer a follow-up.
-    for (const id of ["first", "second"]) {
-      html = await page(id);
-      expect(html).toContain('data-mode="reply"');
-      expect(html).toContain(`Starts a follow-up on <code>agent/${id}</code>`);
-    }
+    // The runner is idle: both can go on.
+    for (const id of ["first", "second"]) expect(await composer(id)).toEqual({ mode: "reply" });
 
-    // A checkout with leftovers: its own conversation goes on, every other page says what to clean up.
+    // A checkout with leftovers: its own conversation goes on, every other is told what to clean up.
     await call("POST", "/conversations/first/runs", { prompt: "dirty" });
     await runner.idle();
-    expect(await page("first")).toContain('data-mode="reply"');
-    html = await page("second");
-    expect(html).toContain('data-mode="off"');
-    expect(html).toContain("<strong>demo</strong> has uncommitted changes on <code>agent/first</code>.");
-    expect(html).toContain('<li class="checkout dirty"');
-    expect(html).toContain('<span class="flag">uncommitted changes</span>');
-
-    // A page waiting with no run of its own reloads when any run takes or gives back the root.
-    rmSync(path.join(checkout, "leftover.txt"));
-    const waiting = await openStream("/ui/conversations/second/stream");
-    expect((await waiting.next())?.event).toBe("ready");
-    const followup = await call("POST", "/conversations/first/runs", { prompt: "hang" });
-    expect((await waiting.next())?.event).toBe("reload");
-    const waitingAgain = await openStream("/ui/conversations/second/stream");
-    expect((await waitingAgain.next())?.event).toBe("ready");
-    await call("POST", `/conversations/first/runs/${followup.body.runId}/cancel`);
-    expect((await waitingAgain.next())?.event).toBe("reload");
-    expect(await page("second")).toContain('data-mode="reply"');
-  });
-
-  it("derives the workspace's terminal from the service's URL", () => {
-    expect(terminalUrlOf("https://coder.example.com/@me/ws/apps/claude")).toBe("https://coder.example.com/@me/ws/terminal");
-    expect(terminalUrlOf("https://coder.example.com/@me/ws/apps/claude/")).toBe("https://coder.example.com/@me/ws/terminal");
-    expect(terminalUrlOf("https://claude--ws--me.coder.example.com")).toBeUndefined();
-    expect(terminalUrlOf(undefined)).toBeUndefined();
+    expect(await composer("first")).toEqual({ mode: "reply" });
+    expect(await composer("second")).toEqual({ mode: "off", reason: "dirty", name: "demo", path: checkout, branch: "agent/first" });
   });
 
   it("starts a conversation from the named base branch", async () => {
@@ -751,7 +708,7 @@ describe("claude code runner", () => {
     await call("PUT", "/conversations/rel", { prompt: "On release", baseBranch: "release" });
     await runner.idle();
     expect(filesOn("agent/rel")).toEqual(["README.md", "RELEASE.md", expect.stringMatching(/^change-/)]);
-    expect(await sql("SELECT base_branch FROM conversations WHERE id = 'rel'")).toEqual([{ base_branch: "release" }]);
+    expect(kept("rel").baseBranch).toBe("release");
 
     // The service can have a base branch of its own; the launch's still wins.
     await restart({ baseBranch: "release" });
@@ -819,8 +776,8 @@ describe("claude code runner", () => {
     expect(summary).toHaveLength(20_000);
     expect(summary!.startsWith("Done: xxx")).toBe(true);
     expect(summary!.endsWith("…")).toBe(true);
-    // The whole answer is in the database.
-    expect(await sql("SELECT length(result_text) AS n FROM runs WHERE conversation_id = 'long'")).toEqual([{ n: 25_006 }]);
+    // The whole answer is in the run's events.
+    expect(eventsOf(kept("long").runs[0].id).at(-1)!.event.result).toHaveLength(25_006);
   });
 
   it("reports why Claude Code failed and starts the session again after it refused", async () => {
@@ -847,7 +804,8 @@ describe("claude code runner", () => {
     await call("PUT", "/conversations/stuck", { prompt: "refuse" });
     await runner.idle();
     // What older versions stored: sessionStarted set as soon as claude was spawned.
-    await sql("UPDATE conversations SET session_started = true WHERE id = 'stuck'");
+    await store.flush();
+    writeFileSync(path.join(state, "conversations", "stuck.json"), JSON.stringify({ ...kept("stuck"), sessionStarted: true }));
     await restart();
 
     await call("POST", "/conversations/stuck/runs", { prompt: "Try again" });
@@ -866,7 +824,8 @@ describe("claude code runner", () => {
 
   it("marks a run interrupted by a restart as failed", async () => {
     await call("PUT", "/conversations/restart", { prompt: "hang" });
-    const otherStore = new Store(inject("databaseUrl"));
+    await store.flush();
+    const otherStore = new Store(state);
     const restarted = new ConversationRunner({
       store: otherStore,
       root,
@@ -875,12 +834,11 @@ describe("claude code runner", () => {
     });
     await restarted.load();
     expect(restarted.get("restart")?.status).toBe("failed");
-    await otherStore.close();
     const run = runner.get("restart")!.runId;
     await call("POST", `/conversations/restart/runs/${run}/cancel`);
   });
 
-  it("keeps conversations only in the database", async () => {
+  it("keeps what it remembers in files only it can read, and knows everything from them after a restart", async () => {
     const launched = await call("PUT", "/conversations/kept", {
       prompt: "Add a file",
       repository: REPOSITORY,
@@ -891,21 +849,28 @@ describe("claude code runner", () => {
     await runner.idle();
 
     // The launch's `repository` names the checkout, and is the conversation's.
-    expect(await sql("SELECT id, title, repository, branch, session_started, pushed, pr_url, base_commit IS NOT NULL AS has_base FROM conversations")).toEqual([
-      { id: "kept", title: "Add a file", repository: REPOSITORY, branch: "agent/kept", session_started: true, pushed: true, pr_url: `${REPOSITORY}/pull/7`, has_base: true },
-    ]);
-    const runs = await sql("SELECT seq, status, prompt, error, stderr FROM runs ORDER BY seq");
-    expect(runs).toMatchObject([
-      { seq: 1, status: "finished", prompt: "Add a file", error: null },
-      { seq: 2, status: "failed", prompt: "refuse", error: expect.stringContaining("root/sudo") },
-    ]);
-    expect(runs[1]!.stderr).toContain("--dangerously-skip-permissions cannot be used");
-    expect(await sql("SELECT type, subtype FROM events ORDER BY seq")).toEqual([
-      { type: "system", subtype: "init" },
-      { type: "result", subtype: "success" },
-    ]);
+    const file = path.join(state, "conversations", "kept.json");
+    const kept = JSON.parse(readFileSync(file, "utf8"));
+    expect(kept).toMatchObject({
+      id: "kept",
+      title: "Add a file",
+      repository: REPOSITORY,
+      branch: "agent/kept",
+      sessionStarted: true,
+      pushed: true,
+      prUrl: `${REPOSITORY}/pull/7`,
+      baseCommit: expect.any(String),
+      runs: [
+        { status: "finished", prompt: "Add a file" },
+        { status: "failed", prompt: "refuse", error: expect.stringContaining("root/sudo"), stderr: expect.stringContaining("--dangerously-skip-permissions cannot be used") },
+      ],
+    });
+    const events = readFileSync(path.join(state, "events", `${launched.body.runId}.jsonl`), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(events.map(({ event }) => [event.type, event.subtype])).toEqual([["system", "init"], ["result", "success"]]);
+    expect(events[0].at).toEqual(expect.any(String));
+    expect(statSync(file).mode & 0o077).toBe(0);
+    expect(readdirSync(path.join(state, "events"))).toHaveLength(1);
 
-    // A restarted service knows everything from the database alone.
     await restart();
     expect((await call("GET", `/conversations/kept/runs/${launched.body.runId}`)).body).toMatchObject({
       status: "finished",
@@ -913,13 +878,14 @@ describe("claude code runner", () => {
       prUrl: `${REPOSITORY}/pull/7`,
     });
     expect((await call("GET", "/conversations/kept")).body.status).toBe("failed");
-    const html = await (await fetch(`${base}/ui/conversations/kept`)).text();
-    expect(html).toContain("Run 2");
-    expect(html).toContain("success");
+    const transcript = (await call("GET", "/conversations/kept/transcript")).body as unknown as Transcript;
+    expect(transcript.runs.map((run) => [run.seq, run.events.length])).toEqual([[1, 2], [2, 0]]);
   });
 
-  it("starts nothing when the database cannot store the launch", async () => {
-    await store.close();
+  it("starts nothing when the launch cannot be stored", async () => {
+    // The directory conversations are written to is gone, and a file sits where it was.
+    rmSync(path.join(state, "conversations"), { recursive: true });
+    writeFileSync(path.join(state, "conversations"), "");
     expect(await call("PUT", "/conversations/lost", { prompt: "hi" })).toEqual({
       status: 500,
       body: { code: "internal" },
@@ -928,94 +894,57 @@ describe("claude code runner", () => {
     expect(() => claudeCalls()).toThrow();
   });
 
-  it("streams a running run's events to the conversation page", async () => {
+  it("gives a caller that says what it has only the events it lacks", async () => {
     const launched = await call("PUT", "/conversations/live", { prompt: "stream please" });
     const runId = launched.body.runId!;
-
-    // A page that shows no running run is told to reload; so is one with a stale run.
-    const idle = await openStream("/ui/conversations/live/stream");
-    expect(idle.response.headers.get("content-type")).toContain("text/event-stream");
-    expect((await idle.next())?.event).toBe("ready");
-    expect((await idle.next())?.event).toBe("reload");
-    expect(await idle.next()).toBeUndefined();
-    const stale = await openStream("/ui/agents/live/stream?run=old&after=0");
-    await stale.until((message) => message.event === "reload");
-
-    // The page carries the run it shows as running and how many events it has.
-    const html = await (await fetch(`${base}/ui/conversations/live`)).text();
-    expect(html).toContain(`data-run="${runId}"`);
-    expect(html).toContain(`id="events-${runId}"`);
-
-    const live = await openStream(`/ui/conversations/live/stream?run=${runId}&after=0`);
-    const ops = [];
-    for (;;) {
-      const message = await live.until((item) => item.event === "patch");
-      ops.push(...message.data.ops!);
-      if (ops.some((op) => op.op === "append" && op.html.includes('id="tool-toolu_1"'))) break;
+    const fetched = async (query = "") => ((await call("GET", `/conversations/live/transcript${query}`)).body as unknown as Transcript).runs[0]!;
+    const texts = (run: Transcript["runs"][number]) => run.events.map(({ event }) => event.type);
+    // While the run goes: what Claude has printed so far.
+    let run = await fetched();
+    while (run.events.length < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      run = await fetched();
     }
-    expect(ops.find((op) => op.op === "append" && op.html.includes("Looking"))).toMatchObject({
-      target: `events-${runId}`,
-      html: expect.stringContaining("<strong>around</strong>"),
-    });
-    expect(ops.findLast((op) => op.id === "activity")?.html).toContain("Running Run the tests");
+    expect(run).toMatchObject({ id: runId, status: "running", firstEvent: 0 });
+    expect(texts(run)).toEqual(["system", "assistant"]);
 
     writeFileSync(path.join(dir, "gate"), "");
-    const done = [];
-    for (;;) {
-      const message = await live.next();
-      if (!message || message.event === "reload") break;
-      if (message.event === "patch") done.push(...message.data.ops!);
-    }
-    expect(done.find((op) => op.op === "replace" && op.id === "tool-toolu_1")?.html).toContain("all 12 passed");
-    expect(done.some((op) => op.op === "append" && op.html.includes("Tests pass."))).toBe(true);
     await runner.idle();
-
-    // Once the run has ended the stream has nothing to replay: the page reloads.
-    const after = await openStream(`/ui/conversations/live/stream?run=${runId}&after=2`);
-    await after.until((message) => message.event === "reload");
-    // A page showing no running run waits, and reloads when a follow-up starts.
-    const waiting = await openStream("/ui/conversations/live/stream");
-    expect((await waiting.next())?.event).toBe("ready");
-    rmSync(path.join(dir, "gate"));
-    const followup = await call("POST", "/conversations/live/runs", { prompt: "hang" });
-    expect((await waiting.next())?.event).toBe("reload");
-    await call("POST", `/conversations/live/runs/${followup.body.runId}/cancel`);
-
-    expect((await fetch(`${base}/ui/conversations/missing/stream`)).status).toBe(404);
+    // Holding those two, the caller gets the three that followed, and nothing when it holds all five.
+    run = await fetched(`?have=${runId}:2`);
+    expect(run).toMatchObject({ status: "finished", firstEvent: 2 });
+    expect(texts(run)).toEqual(["user", "assistant", "result"]);
+    expect(await fetched(`?have=${runId}:5,other-run:9`)).toMatchObject({ firstEvent: 5, events: [] });
+    // More than there are is taken for all of them; a malformed list is refused.
+    expect(await fetched(`?have=${runId}:99`)).toMatchObject({ firstEvent: 5, events: [] });
+    expect((await call("GET", "/conversations/live/transcript?have=nonsense")).status).toBe(400);
   });
 
   it("steers a running run with messages, stored before they are sent", async () => {
     const launched = await call("PUT", "/conversations/steered", { prompt: "merge please" });
     const runId = launched.body.runId!;
-    const live = await openStream(`/ui/conversations/steered/stream?run=${runId}&after=0&messages=0`);
-    await live.until((message) => message.event === "patch" && message.data.ops!.some((op) => op.html.includes("Working on it")));
+    const transcript = async () => ((await call("GET", "/conversations/steered/transcript")).body as unknown as Transcript).runs[0]!;
+    while ((await transcript()).events.length < 2) await new Promise((resolve) => setTimeout(resolve, 25));
     const sent = await call("POST", `/conversations/steered/runs/${runId}/messages`, { prompt: "Use pnpm, not npm" });
     expect(sent).toMatchObject({ status: 200, body: { status: "running", runId } });
 
-    // The page shows the message as soon as it is sent.
-    const patch = await live.until((message) => message.event === "patch" && message.data.ops!.some((op) => op.html.includes("user-msg steer")));
-    expect(patch.data.messages).toBe(1);
-    expect(patch.data.ops!.find((op) => op.html.includes("user-msg steer"))?.html).toContain("Use pnpm, not npm");
+    // Stored as soon as it is sent.
+    expect((await transcript()).messages).toMatchObject([{ prompt: "Use pnpm, not npm", sentAt: expect.any(String) }]);
 
     // Claude took it into the turn it was on; with no second result, stdin closes once it is quiet.
     await runner.idle();
     expect((await call("GET", "/conversations/steered")).body.status).toBe("finished");
-    expect(await sql("SELECT seq, prompt FROM run_messages WHERE run_id = $1", [runId])).toEqual([
-      { seq: 1, prompt: "Use pnpm, not npm" },
-    ]);
-    const texts = await sql("SELECT content->0->>'text' AS text FROM events WHERE run_id = $1 AND type = 'assistant' ORDER BY seq", [runId]);
-    expect(texts.map((row) => row.text)).toEqual(["Working on it", "Steered: Use pnpm, not npm"]);
+    const texts = (run: Transcript["runs"][number]) =>
+      run.events.flatMap(({ event }) => (event.type === "assistant" ? [(event as { message: { content: Array<{ text: string }> } }).message.content[0]!.text] : []));
+    expect(texts(await transcript())).toEqual(["Working on it", "Steered: Use pnpm, not npm"]);
 
-    // Kept across a restart, and shown in the transcript between the events around it.
+    // Kept across a restart, with when it was sent: between the events around it.
     await restart();
-    const html = await (await fetch(`${base}/ui/conversations/steered`)).text();
-    expect(html.indexOf("Working on it")).toBeLessThan(html.indexOf("Use pnpm, not npm"));
-    expect(html.indexOf("Use pnpm, not npm")).toBeLessThan(html.indexOf("Steered: Use pnpm"));
-    expect(html).toContain("Sent while Claude was working");
-    // The page's scripts are built in template strings, where a lost backslash breaks them.
-    const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]!);
-    expect(scripts.length).toBeGreaterThan(0);
-    for (const source of scripts) expect(() => new Function(source)).not.toThrow();
+    const run = await transcript();
+    expect(run.messages).toMatchObject([{ prompt: "Use pnpm, not npm" }]);
+    const sentAt = run.messages![0]!.sentAt;
+    const answers = run.events.filter(({ event }) => event.type === "assistant");
+    expect(answers[0]!.at <= sentAt && sentAt <= answers[1]!.at).toBe(true);
 
     // Only a running run takes messages.
     expect(await call("POST", `/conversations/steered/runs/${runId}/messages`, { prompt: "late" })).toEqual({
@@ -1034,9 +963,9 @@ describe("claude code runner", () => {
     writeFileSync(path.join(dir, "gate"), "");
     await runner.idle();
     expect((await call("GET", "/conversations/turns")).body.status).toBe("finished");
-    const texts = await sql("SELECT content->0->>'text' AS text FROM events WHERE run_id = $1 AND type = 'assistant' ORDER BY seq", [runId]);
-    expect(texts.map((row) => row.text)).toEqual(["Echo: first", "Echo: second", "Echo: third"]);
-    expect(await sql("SELECT count(*)::int AS n FROM events WHERE run_id = $1 AND type = 'result'", [runId])).toEqual([{ n: 3 }]);
+    const events = eventsOf(runId).map(({ event }) => event);
+    expect(events.filter((event) => event.type === "assistant").map((event) => event.message.content[0].text)).toEqual(["Echo: first", "Echo: second", "Echo: third"]);
+    expect(events.filter((event) => event.type === "result")).toHaveLength(3);
   });
 
   it("refuses messages to a cancelled run", async () => {
@@ -1073,29 +1002,58 @@ describe("claude code runner", () => {
     expect((await call("GET", "/conversations/bad%2F..")).status).toBe(404);
   });
 
-  it("answers internal when a request fails outside the routes, and stays up", async () => {
+  it("answers internal when a request fails, and stays up", async () => {
     await call("PUT", "/conversations/stable", { prompt: "hi" });
     await finished("stable");
-    // The stream handler runs before the routes: a failure before its headers go out is still a JSON error.
     vi.spyOn(runner, "get").mockImplementationOnce(() => {
       throw new Error("boom");
     });
-    expect((await call("GET", "/ui/conversations/stable/stream")).body).toEqual({ code: "internal" });
-    // Once the stream is open, a failure ends it (the page reconnects) and touches nothing else.
-    vi.spyOn(runner, "liveRun").mockImplementationOnce(() => {
-      throw new Error("boom");
-    });
-    const broken = await openStream("/ui/conversations/stable/stream");
-    expect(broken.response.status).toBe(200);
-    expect((await broken.next())?.event).toBe("ready");
-    expect(await broken.next()).toBeUndefined();
+    expect(await call("GET", "/conversations/stable")).toEqual({ status: 500, body: { code: "internal" } });
     // A reply that cannot be written out is an error too, not a dropped connection.
     vi.spyOn(runner, "workspace").mockResolvedValueOnce({ cost: 1n } as never);
     expect(await call("GET", "/workspace")).toEqual({ status: 500, body: { code: "internal" } });
     vi.restoreAllMocks();
     expect((await call("GET", "/health")).body).toEqual({ ok: true });
-    const again = await openStream("/ui/conversations/stable/stream");
-    expect((await again.next())?.event).toBe("ready");
-    await again.close();
+    // The pages are gone: a browser asking for one gets JSON like every other caller.
+    expect(await call("GET", "/ui/conversations/stable")).toEqual({ status: 404, body: { code: "route_not_found" } });
+  });
+
+  it("takes secrets, keeps them in files only it can read, and gives them to the next run", async () => {
+    const put = async (body: unknown) => {
+      const response = await fetch(`${base}/secrets`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      return { status: response.status, body: await response.json() };
+    };
+    expect(await put({ claudeToken: " claude-secret\n", githubToken: "gh-secret" })).toEqual({
+      status: 200,
+      body: { claudeToken: true, githubToken: true, platformToken: false, platformUrl: false },
+    });
+    // One left out stays as it was.
+    const all = { claudeToken: true, githubToken: true, platformToken: true, platformUrl: true };
+    expect(await put({ platformToken: "platform-secret", platformUrl: "https://platform.example.com" })).toEqual({ status: 200, body: all });
+
+    const file = (name: string) => path.join(secretsDir, name);
+    expect(readFileSync(file("claude-oauth-token"), "utf8")).toBe("claude-secret\n");
+    expect(readFileSync(file("github-token"), "utf8")).toBe("gh-secret\n");
+    for (const name of ["claude-oauth-token", "github-token", "platform-token", "platform-url"]) expect(statSync(file(name)).mode & 0o077).toBe(0);
+    // What a run needs is in the environment it inherits; what only the service needs is not.
+    expect(secretEnv).toMatchObject({
+      CLAUDE_CODE_OAUTH_TOKEN: "claude-secret",
+      GH_TOKEN: "gh-secret",
+      GIT_CONFIG_VALUE_1: "!gh auth git-credential",
+    });
+    expect(JSON.stringify(secretEnv)).not.toContain("platform-secret");
+
+    // Nothing gives them back, and what is not a secret is refused without being quoted.
+    expect((await fetch(`${base}/secrets`)).status).toBe(404);
+    const refused = await put({ claudeToken: "two\nlines" });
+    expect(refused.status).toBe(400);
+    expect(JSON.stringify(refused.body)).not.toContain("two");
+    expect((await put({ platformUrl: "not a url" })).status).toBe(400);
+    expect(secretEnv.CLAUDE_CODE_OAUTH_TOKEN).toBe("claude-secret");
+
+    // A restarted service reads them back from the files.
+    await restart();
+    expect(secretEnv).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: "claude-secret", GH_TOKEN: "gh-secret" });
+    expect((await put({})).body).toEqual(all);
   });
 });

@@ -4,10 +4,10 @@ import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
-import type { ClaudeEvent, Conversation, Run, RunMessage, RunStatus, Store, StoredEvent } from "./db.ts";
+import type { ClaudeEvent, Conversation, Run, RunMessage, RunStatus, Store, StoredEvent } from "./store.ts";
 import { log, since } from "./log.ts";
 
-export type { RunMessage, RunStatus } from "./db.ts";
+export type { RunMessage, RunStatus } from "./store.ts";
 
 export type Image = { data: string; mimeType: string } | { url: string };
 
@@ -20,7 +20,7 @@ export interface LaunchRequest extends PromptRequest {
   /**
    * The repository to work in, as an https URL: its checkout under the root is `<root>/<name>`,
    * `name` being the URL's last segment (see `checkoutName`). Without it, the root itself must
-   * be a checkout.
+   * be a checkout. `NO_REPOSITORY` instead of a URL says the task has none: see there.
    */
   repository?: string;
   openPr?: boolean;
@@ -45,8 +45,6 @@ export interface ConversationView {
   error?: string;
   /** What Claude answered at the end of the run (its `result` text), cut to `SUMMARY_MAX` chars. */
   summary?: string;
-  /** Where a person can follow the run in a browser. Only when the public URL is known. */
-  url?: string;
 }
 
 /** Everything the transcript page shows about a conversation. */
@@ -57,7 +55,8 @@ export interface Transcript {
   branch?: string;
   pushed: boolean;
   prUrl?: string;
-  runs: Array<Run & { seq: number; events: StoredEvent[] }>;
+  /** Each with its events from `firstEvent` on: all of them, unless the caller said what it has. */
+  runs: Array<Run & { seq: number; firstEvent: number; events: StoredEvent[] }>;
   /** What the page's message box can do right now. */
   composer: ComposerState;
 }
@@ -144,30 +143,9 @@ export interface RunnerOptions {
   claudeModel?: string;
   ghCommand: string;
   env?: NodeJS.ProcessEnv;
-  /** The service's base URL as seen from a browser (through Coder's app proxy). */
-  publicUrl?: string;
   /** See `STEER_IDLE_MS`; tests shorten it. */
   steerIdleMs?: number;
 }
-
-/** What a run going right now has printed so far. Held in memory only while it runs. */
-export interface LiveRun {
-  runId: string;
-  startedAt: string;
-  events: StoredEvent[];
-  /** Messages sent to it so far, as in `Run.messages`. */
-  messages: RunMessage[];
-}
-
-/**
- * Pushed to `subscribe` listeners as it happens: each stream-json line of the running run, and
- * the start and end of a run. `end` comes once the run's outcome and every event are stored.
- */
-export type LiveUpdate =
-  | { type: "event"; runId: string; seq: number; event: StoredEvent }
-  | { type: "message"; runId: string; message: RunMessage }
-  | { type: "start"; runId: string }
-  | { type: "end"; runId: string };
 
 /** A run was asked for while another one is going: one run at a time across the root. */
 export class ConversationBusy extends Error {
@@ -178,6 +156,14 @@ export class ConversationBusy extends Error {
     this.conversation = conversation;
   }
 }
+
+/**
+ * What a launch names as its `repository` when the task has none (a question, a check-in):
+ * the conversation then works in the root itself, on no branch, and its runs neither switch
+ * a checkout nor commit, push or open a PR. Rakazo's adapter sends it for a task without a
+ * repository, so the name is part of the contract.
+ */
+export const NO_REPOSITORY = "no_repo";
 
 /** A checkout under the root has uncommitted changes that are not the conversation's own, so no run can start. */
 export class CheckoutDirty extends Error {
@@ -251,7 +237,7 @@ const CLAUDE_STDERR_KEPT = 64_000;
 const MAX_ERROR = 500;
 /**
  * Longest `summary` in a view: what Rakazo keeps of a reply (its `CLOUD_AGENT_SUMMARY_MAX`). The
- * full text stays in the database (`runs.result_text`).
+ * full text stays in the store (`runs.result_text`).
  */
 const SUMMARY_MAX = 20_000;
 /** How long a scan of the checkouts (branch, uncommitted changes) serves the pages before a new one. */
@@ -284,8 +270,8 @@ const IGNORED_CHECKOUTS = new Set(["claude-relay", "apify-dev-sandbox"]);
  * conversation or of a person (`CheckoutDirty`). A run puts its own checkout on the
  * conversation's branch and every other checkout on its default branch.
  *
- * Every conversation and run lives in the database. The in-memory map is a cache filled
- * from it at start; a change counts only once the database has it.
+ * Every conversation and run lives in the store. The in-memory map is a cache filled
+ * from it at start; a change counts only once the store has it.
  */
 export class ConversationRunner {
   private readonly options: RunnerOptions;
@@ -300,15 +286,11 @@ export class ConversationRunner {
   private scannedAt = 0;
   /** The default branch of each checkout under the root, by path, once read from its origin. */
   private readonly defaults = new Map<string, string>();
-  /** Told whenever the lock changes hands; see `watch`. */
-  private readonly watchers = new Set<() => void>();
   /** The child process a conversation is waiting on right now (git, claude or gh). */
   private readonly children = new Map<string, ChildProcess>();
   private readonly active = new Map<string, Promise<void>>();
   private readonly cancelled = new Set<string>();
-  private readonly live = new Map<string, LiveRun>();
   private readonly inputs = new Map<string, Input>();
-  private readonly listeners = new Map<string, Set<(update: LiveUpdate) => void>>();
 
   constructor(options: RunnerOptions) {
     this.options = options;
@@ -316,7 +298,7 @@ export class ConversationRunner {
   }
 
   /**
-   * Checks the root and loads every conversation from the database. A run that was going
+   * Checks the root and loads every conversation from the store. A run that was going
    * when the runner stopped can never finish. Checkouts are checked per run, not here: the
    * root may gain and lose them while the service runs.
    */
@@ -355,11 +337,15 @@ export class ConversationRunner {
       title: titleOf(request.prompt),
       sessionId: randomUUID(),
       sessionStarted: false,
-      // Without one, `locate` records the root checkout's origin.
-      ...(request.repository ? { repository: repositoryUrl(request.repository) } : {}),
-      branch: `agent/${id.slice(0, 12)}`,
-      ...(request.baseBranch ? { baseBranch: request.baseBranch } : {}),
-      openPr: request.openPr ?? false,
+      ...(request.repository === NO_REPOSITORY
+        ? { noRepository: true as const, openPr: false }
+        : {
+            // Without one, `locate` records the root checkout's origin.
+            ...(request.repository ? { repository: repositoryUrl(request.repository) } : {}),
+            branch: `agent/${id.slice(0, 12)}`,
+            ...(request.baseBranch ? { baseBranch: request.baseBranch } : {}),
+            openPr: request.openPr ?? false,
+          }),
       pushed: false,
       runs: [],
     };
@@ -411,22 +397,9 @@ export class ConversationRunner {
     this.changed();
   }
 
-  /** The lock changed hands, or a run changed the checkouts: the pages' workspace section is stale. */
+  /** The lock changed hands, or a run changed the checkouts: the last scan is stale. */
   private changed() {
     this.scanned = undefined;
-    for (const watcher of this.watchers) {
-      try {
-        watcher();
-      } catch (error) {
-        log.error("workspace watcher failed", { error: error instanceof Error ? error.message : String(error) });
-      }
-    }
-  }
-
-  /** Calls `listener` whenever a run takes or gives back the root, until the returned function is called. */
-  watch(listener: () => void): () => void {
-    this.watchers.add(listener);
-    return () => this.watchers.delete(listener);
   }
 
   /**
@@ -572,11 +545,13 @@ export class ConversationRunner {
    * when it is a checkout of that repository (a workspace with one checkout). Either must have
    * the repository as its origin, so a clone of something else under that name is refused. A
    * conversation without a repository works in the root, which must then be a checkout, and
-   * records its origin as the repository.
+   * records its origin as the repository; one launched with `NO_REPOSITORY` works in the root
+   * whatever it is.
    */
   private async locate(conversation: Conversation): Promise<string> {
     const { root } = this.options;
     const { repository } = conversation;
+    if (conversation.noRepository) return root;
     if (!repository) {
       const origin = await this.origin(conversation, root);
       if (!origin) throw new CheckoutMissing(`${root} is not a git checkout with an origin.`, root);
@@ -630,8 +605,12 @@ export class ConversationRunner {
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
-  /** The conversation's runs with their Claude Code events. */
-  async transcript(id: string): Promise<Transcript | undefined> {
+  /**
+   * The whole conversation, its runs with their Claude Code events. `have` says how many of each run's events the caller already
+   * holds, by run id: those are left out, and each run's `firstEvent` says where its `events`
+   * begin, so a caller that keeps what it gets fetches every event once.
+   */
+  async transcript(id: string, have: ReadonlyMap<string, number> = new Map()): Promise<Transcript | undefined> {
     const conversation = this.conversations.get(id);
     if (!conversation) return undefined;
     const runs = [...conversation.runs];
@@ -643,7 +622,11 @@ export class ConversationRunner {
       ...(conversation.branch ? { branch: conversation.branch } : {}),
       pushed: conversation.pushed,
       ...(conversation.prUrl ? { prUrl: conversation.prUrl } : {}),
-      runs: runs.map((run, index) => ({ ...run, seq: index + 1, events: events.get(run.id) ?? [] })),
+      runs: runs.map((run, index) => {
+        const all = events.get(run.id) ?? [];
+        const firstEvent = Math.min(have.get(run.id) ?? 0, all.length);
+        return { ...run, seq: index + 1, firstEvent, events: all.slice(firstEvent) };
+      }),
       composer: this.composer(conversation, workspace),
     };
   }
@@ -656,8 +639,9 @@ export class ConversationRunner {
   private composer(conversation: Conversation, workspace: Workspace): ComposerState {
     const run = conversation.runs.at(-1);
     if (run?.status === "running") return { mode: "steer", runId: run.id };
-    // Every conversation records its repository on its first run; one without never had one.
-    if (!conversation.repository) return { mode: "off", reason: "no_checkout", path: this.options.root };
+    // Every conversation records its repository on its first run; one without never had one,
+    // unless it was launched to work in no checkout.
+    if (!conversation.repository && !conversation.noRepository) return { mode: "off", reason: "no_checkout", path: this.options.root };
     const refusal = this.refusal(workspace.checkouts, conversation.repository, conversation);
     return refusal ? { mode: "off", ...refusal } : { mode: "reply" };
   }
@@ -706,7 +690,7 @@ export class ConversationRunner {
     const seq = (run.messages?.length ?? 0) + input.storing + 1;
     input.storing += 1;
     try {
-      await this.store.saveRunMessage(id, runId, seq, message, request.images);
+      await this.store.saveRunMessage(id, runId, message);
     } catch (error) {
       log.error("could not store the message, not sent", {
         conversation: id,
@@ -725,8 +709,6 @@ export class ConversationRunner {
     } else if (!input.stdin && input.open) input.queued.push(line);
     // Only if `claude` exited while the message was being stored.
     else log.warn("message stored but claude had already exited", { conversation: id, run: runId });
-    this.live.get(id)?.messages.push(message);
-    this.emit(id, { type: "message", runId, message });
     log.info("message sent to run", { conversation: id, run: runId, seq, images: request.images?.length });
     this.maybeCloseInput(input);
     return this.view(conversation, run);
@@ -760,40 +742,6 @@ export class ConversationRunner {
     input.stdin?.end();
   }
 
-  /**
-   * The conversation's running run with every event it has printed so far, which may be ahead
-   * of the database (event writes are queued). Undefined once the run has an outcome.
-   */
-  liveRun(id: string): LiveRun | undefined {
-    const live = this.live.get(id);
-    const run = this.conversations.get(id)?.runs.at(-1);
-    return live && run?.id === live.runId && run.status === "running" ? live : undefined;
-  }
-
-  /** Calls `listener` with every live update of the conversation until the returned function is called. */
-  subscribe(id: string, listener: (update: LiveUpdate) => void): () => void {
-    let set = this.listeners.get(id);
-    if (!set) this.listeners.set(id, (set = new Set()));
-    set.add(listener);
-    return () => {
-      set.delete(listener);
-      if (!set.size) this.listeners.delete(id);
-    };
-  }
-
-  private emit(id: string, update: LiveUpdate) {
-    for (const listener of this.listeners.get(id) ?? []) {
-      try {
-        listener(update);
-      } catch (error) {
-        log.error("live listener failed", {
-          conversation: id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-  }
-
   /** Waits for every running conversation and pending database write; tests use it to observe finished runs. */
   async idle() {
     await Promise.all(this.active.values());
@@ -813,16 +761,13 @@ export class ConversationRunner {
       startedAt: new Date().toISOString(),
     };
     conversation.runs.push(run);
-    // Before anything awaits, so a page showing the run as running always finds it live.
-    this.live.set(conversation.id, { runId: run.id, startedAt: run.startedAt, events: [], messages: [] });
     this.inputs.set(conversation.id, { runId: run.id, open: true, queued: [], storing: 0, written: 0, results: 0 });
     const seq = conversation.runs.length;
     try {
       if (seq === 1) await this.store.saveConversation(conversation);
-      await this.store.saveRun(conversation.id, seq, run, request.images);
+      await this.store.saveRun(conversation.id, seq, run);
     } catch (error) {
       conversation.runs.pop();
-      this.live.delete(conversation.id);
       this.inputs.delete(conversation.id);
       this.release(conversation);
       if (seq === 1) this.conversations.delete(conversation.id);
@@ -847,16 +792,11 @@ export class ConversationRunner {
       this.release(conversation);
     });
     this.active.set(conversation.id, work);
-    this.emit(conversation.id, { type: "start", runId: run.id });
     return this.view(conversation, run);
   }
 
   private view(conversation: Conversation, run: Run): ConversationView {
-    const base = this.options.publicUrl?.replace(/\/+$/, "");
-    return {
-      ...view(conversation, run),
-      ...(base ? { url: `${base}/ui/conversations/${conversation.id}` } : {}),
-    };
+    return view(conversation, run);
   }
 
   /**
@@ -921,10 +861,8 @@ export class ConversationRunner {
     if (run.status === "failed") log.warn("run ended", fields);
     else log.info("run ended", fields);
     // The run's outcome went through the conversation's write queue after its events, so the
-    // database now has all of them.
-    this.live.delete(conversation.id);
+    // files now have all of them.
     this.inputs.delete(conversation.id);
-    this.emit(conversation.id, { type: "end", runId: run.id });
   }
 
   /**
@@ -933,6 +871,8 @@ export class ConversationRunner {
    * top of the defaults".
    */
   private async prepare(conversation: Conversation) {
+    // In no checkout, so none is switched: the checkouts stay the last run's picture.
+    if (conversation.noRepository) return;
     try {
       await this.prepareOwn(conversation);
       const own = this.checkoutOf(conversation);
@@ -1030,7 +970,9 @@ export class ConversationRunner {
     run: Run,
     request: PromptRequest,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
-    const note = `You are working in a checkout shared with other tasks, on its git branch ${conversation.branch}; stay on it, and do not switch branches, stash, or reset. When you finish, any uncommitted changes are committed and the branch is pushed${conversation.openPr ? " with a pull request" : ""}, so do not push or open a pull request yourself.`;
+    const note = conversation.noRepository
+      ? "This task names no repository. You are in a directory holding git checkouts shared with other tasks: read them freely, but do not change files in them, switch branches, commit, or push. Nothing you leave here is committed or published."
+      : `You are working in a checkout shared with other tasks, on its git branch ${conversation.branch}; stay on it, and do not switch branches, stash, or reset. When you finish, any uncommitted changes are committed and the branch is pushed${conversation.openPr ? " with a pull request" : ""}, so do not push or open a pull request yourself.`;
     const args = [
       "--print",
       "--input-format",
@@ -1084,10 +1026,7 @@ export class ConversationRunner {
       }
       seq += 1;
       const at = new Date();
-      const stored = { at: at.toISOString(), event };
-      this.live.get(conversation.id)?.events.push(stored);
-      this.store.saveEvent(conversation.id, run.id, seq, at, event);
-      this.emit(conversation.id, { type: "event", runId: run.id, seq, event: stored });
+      this.store.saveEvent(conversation.id, run.id, at, event);
       if (event.type === "result" && input) {
         input.results += 1;
         this.maybeCloseInput(input);
@@ -1137,6 +1076,7 @@ export class ConversationRunner {
   }
 
   private async publish(conversation: Conversation) {
+    if (conversation.noRepository) return;
     await this.exec(conversation, "git", ["add", "--all"]);
     if ((await this.exec(conversation, "git", ["status", "--porcelain"])).trim()) {
       await this.exec(conversation, "git", ["commit", "--message", conversation.title], {

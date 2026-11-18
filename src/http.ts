@@ -1,9 +1,9 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { AvailabilityQuery, ConversationView, ConversationRunner, Image, LaunchRequest, PromptRequest, RunMessage } from "./runner.ts";
+import type { AvailabilityQuery, ConversationView, ConversationRunner, Image, LaunchRequest, PromptRequest } from "./runner.ts";
 import { log, since } from "./log.ts";
-import { CheckoutDirty, CheckoutMissing, ConversationBusy, RunNotRunning, checkoutName } from "./runner.ts";
-import type { LiveOp, PageOptions } from "./ui.ts";
-import { LiveRunRenderer, conversationsPage, sidePanels, transcriptPage } from "./ui.ts";
+import { CheckoutDirty, CheckoutMissing, ConversationBusy, NO_REPOSITORY, RunNotRunning, checkoutName } from "./runner.ts";
+import type { SecretStore, Secrets } from "./secrets.ts";
+import { SECRET_KEYS } from "./secrets.ts";
 
 const MAX_BODY_BYTES = 128 * 1024 * 1024;
 const MAX_PROMPT_CHARS = 100_000;
@@ -12,29 +12,22 @@ const MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"
 const ID = "[A-Za-z0-9_-]{1,128}";
 const ID_ONLY = new RegExp(`^${ID}$`);
 // `/conversations` is canonical. `/agents` is Rakazo's name for a conversation and stays
-// as an alias, because the fork's Coder adapter calls those paths.
+// as an alias, because the fork's `apify-remote-platform` adapter calls those paths.
 const BASE = "/(?:conversations|agents)";
+const LIST = new RegExp(`^${BASE}/?$`);
 const CONVERSATION = new RegExp(`^${BASE}/(${ID})$`);
+const TRANSCRIPT = new RegExp(`^${BASE}/(${ID})/transcript$`);
 const RUNS = new RegExp(`^${BASE}/(${ID})/runs$`);
 const RUN = new RegExp(`^${BASE}/(${ID})/runs/(${ID})$`);
 const CANCEL = new RegExp(`^${BASE}/(${ID})/runs/(${ID})/cancel$`);
 const MESSAGES = new RegExp(`^${BASE}/(${ID})/runs/(${ID})/messages$`);
-const UI = new RegExp(`^/ui${BASE}/(${ID})$`);
-const UI_LIST = /^\/ui\/(conversations|agents)(\/?)$/;
-const UI_STREAM = new RegExp(`^/ui${BASE}/(${ID})/stream$`);
+/** The longest a secret may be: a token, or a URL. */
+const MAX_SECRET_CHARS = 4096;
 
-/** How long changes to the page are gathered before they are sent together. */
-const STREAM_BATCH_MS = 100;
-/** How often the sidebars (cost, counts, conversation list) are re-sent while a run goes. */
-const STREAM_PANELS_MS = 5_000;
-/** Keeps proxies from closing a quiet stream; the page also treats silence as a lost stream. */
-const STREAM_PING_MS = 15_000;
-
-/** `html` is only for the browser page; everything Rakazo calls stays JSON. */
-type Reply = { status: number; body: unknown; html?: string };
+type Reply = { status: number; body: unknown };
 
 /** JSON API over the runner. Listens on loopback only; Coder's app proxy authenticates callers. */
-export function createHandler(runner: ConversationRunner, pages: PageOptions = {}) {
+export function createHandler(runner: ConversationRunner, secrets: SecretStore) {
   return (request: IncomingMessage, response: ServerResponse) => {
     const started = performance.now();
     // Nothing escapes the handler: a throw here would be an uncaught exception, and the client
@@ -57,19 +50,7 @@ export function createHandler(runner: ConversationRunner, pages: PageOptions = {
         response.destroy();
       }
     };
-    let live: RegExpExecArray | null;
-    try {
-      live = UI_STREAM.exec(new URL(request.url ?? "/", "http://runner").pathname);
-      if (live && request.method === "GET") {
-        stream(runner, pages, live[1]!, request, response);
-        logRequest(request, response.statusCode, since(started));
-        return;
-      }
-    } catch (error) {
-      failed(error);
-      return;
-    }
-    route(runner, pages, request)
+    route(runner, secrets, request)
       .catch((error: unknown): Reply => {
         // One run at a time across the root. `busy` is the code Rakazo knows; `reason` and the rest
         // are additive: `locked` names the conversation whose run is going, `dirty` the checkout
@@ -105,11 +86,11 @@ export function createHandler(runner: ConversationRunner, pages: PageOptions = {
         });
         return { status: 500, body: { code: "internal" } };
       })
-      .then(({ status, body, html }) => {
+      .then(({ status, body }) => {
         // Serialized before the headers go out, so a body that cannot be serialized still gets `internal`.
-        const text = html ?? JSON.stringify(body);
+        const text = JSON.stringify(body);
         logRequest(request, status, since(started));
-        response.writeHead(status, { "content-type": html !== undefined ? "text/html; charset=utf-8" : "application/json" });
+        response.writeHead(status, { "content-type": "application/json" });
         response.end(text);
       })
       .catch(failed);
@@ -125,22 +106,34 @@ function logRequest(request: IncomingMessage, status: number, ms: number) {
   else log.info("request", fields);
 }
 
-async function route(runner: ConversationRunner, pages: PageOptions, request: IncomingMessage): Promise<Reply> {
+async function route(runner: ConversationRunner, secrets: SecretStore, request: IncomingMessage): Promise<Reply> {
   const url = new URL(request.url ?? "/", "http://runner");
   const pathname = url.pathname;
   const method = request.method ?? "GET";
   if (pathname === "/health" && method === "GET") return { status: 200, body: { ok: true } };
   if (pathname === "/workspace" && method === "GET") return { status: 200, body: await runner.workspace() };
+  if (pathname === "/secrets" && method === "PUT") {
+    await secrets.set(secretsRequest(await readJson(request)));
+    // Which are there now, never what they are.
+    return { status: 200, body: secrets.present() };
+  }
   if (pathname === "/availability" && method === "GET") {
     const availability = await runner.availability(availabilityQuery(url.searchParams));
     return availability ? { status: 200, body: availability } : { status: 404, body: { code: "not_found" } };
   }
+  if (LIST.test(pathname) && method === "GET") return { status: 200, body: { conversations: runner.list() } };
   const conversation = CONVERSATION.exec(pathname);
   if (conversation && method === "PUT") {
     const body = launchRequest(await readJson(request));
     return found(await runner.launch(conversation[1]!, body));
   }
   if (conversation && method === "GET") return found(runner.get(conversation[1]!));
+  const transcript = TRANSCRIPT.exec(pathname);
+  if (transcript && method === "GET") {
+    // Everything about the conversation, for whoever keeps and shows it; `have` leaves out the events it holds.
+    const found = await runner.transcript(transcript[1]!, haveQuery(url.searchParams));
+    return found ? { status: 200, body: found } : { status: 404, body: { code: "not_found" } };
+  }
   const runs = RUNS.exec(pathname);
   if (runs && method === "POST")
     return found(await runner.reply(runs[1]!, promptRequest(await readJson(request))));
@@ -151,146 +144,7 @@ async function route(runner: ConversationRunner, pages: PageOptions, request: In
   const messages = MESSAGES.exec(pathname);
   if (messages && method === "POST")
     return found(await runner.steer(messages[1]!, messages[2]!, promptRequest(await readJson(request))));
-  const ui = UI.exec(pathname);
-  if (ui && method === "GET") {
-    const transcript = await runner.transcript(ui[1]!);
-    if (!transcript) return { status: 404, body: { code: "not_found" } };
-    return { status: 200, body: null, html: transcriptPage(transcript, runner.list(), await runner.workspace(), pages) };
-  }
-  const uiList = UI_LIST.exec(pathname);
-  if (uiList && method === "GET") {
-    // Relative links: `/ui/conversations` needs `conversations/<id>`, `/ui/conversations/` needs `./<id>`.
-    const hrefPrefix = uiList[2] ? "./" : `${uiList[1]}/`;
-    return { status: 200, body: null, html: conversationsPage(runner.list(), await runner.workspace(), hrefPrefix, pages) };
-  }
   return { status: 404, body: { code: "route_not_found" } };
-}
-
-/**
- * `GET /ui/conversations/:id/stream?run=<runId>&after=<n>`: server-sent events for the open
- * transcript page, which says which run it shows as running (`run`) and how many of its events
- * it has (`after`). Sends `patch` ({ seq, ops }) for each batch of new events, and `reload` when
- * the page is out of date (a run started or ended), after which the stream ends. A page showing
- * no running run waits here for the next one to start.
- */
-function stream(runner: ConversationRunner, pages: PageOptions, id: string, request: IncomingMessage, response: ServerResponse) {
-  const conversation = runner.get(id);
-  if (!conversation) {
-    response.writeHead(404, { "content-type": "application/json" });
-    response.end(JSON.stringify({ code: "not_found" }));
-    return;
-  }
-  const params = new URL(request.url ?? "/", "http://runner").searchParams;
-  const pageRun = params.get("run") ?? "";
-  const after = Number(params.get("after") ?? "0");
-  const messagesShown = Number(params.get("messages") ?? "0");
-  response.writeHead(200, {
-    "content-type": "text/event-stream; charset=utf-8",
-    "cache-control": "no-cache, no-transform",
-    // Asks nginx-style proxies not to buffer the stream.
-    "x-accel-buffering": "no",
-  });
-  const send = (event: string, data: unknown) => response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-  send("ready", {});
-
-  const timers = new Set<NodeJS.Timeout>();
-  const later = (ms: number, run: () => void) => {
-    const timer = setTimeout(() => {
-      timers.delete(timer);
-      run();
-    }, ms);
-    timers.add(timer);
-    return timer;
-  };
-  let unsubscribe = () => {};
-  let closed = false;
-  const close = () => {
-    if (closed) return;
-    closed = true;
-    unsubscribe();
-    for (const timer of timers) clearTimeout(timer);
-    response.end();
-  };
-  response.on("close", close);
-  const reload = () => {
-    send("reload", {});
-    close();
-  };
-
-  const attach = () => {
-    const liveRun = runner.liveRun(id);
-    if (!pageRun) {
-      // The page shows no run going: it needs to hear when one starts, and when any run takes or
-      // gives back the root, since that changes what its message box can do.
-      if (liveRun) return reload();
-      const unsubscribeRun = runner.subscribe(id, (update) => {
-        if (update.type === "start" || update.type === "end") reload();
-      });
-      const unwatch = runner.watch(reload);
-      unsubscribe = () => {
-        unsubscribeRun();
-        unwatch();
-      };
-    } else {
-      if (!liveRun || liveRun.runId !== pageRun || !Number.isInteger(after) || after < 0 || after > liveRun.events.length || !Number.isInteger(messagesShown) || messagesShown < 0 || messagesShown > liveRun.messages.length)
-        return reload();
-      const renderer = new LiveRunRenderer(pageRun, liveRun.startedAt);
-      let pending: LiveOp[] = [];
-      let batch: NodeJS.Timeout | undefined;
-      const flush = () => {
-        batch = undefined;
-        if (closed) return;
-        send("patch", { seq: renderer.count, messages: messageCount, ops: [...pending, renderer.activity()] });
-        pending = [];
-      };
-      const take = (event: Parameters<LiveRunRenderer["push"]>[0]) => {
-        for (const op of renderer.push(event)) {
-          // A later re-render of the same element replaces an earlier one still waiting.
-          if (op.op === "replace") pending = pending.filter((item) => item.op !== "replace" || item.id !== op.id);
-          pending.push(op);
-        }
-        batch ??= later(STREAM_BATCH_MS, flush);
-      };
-      let messageCount = messagesShown;
-      const takeMessage = (message: RunMessage) => {
-        messageCount += 1;
-        pending.push(renderer.message(message));
-        batch ??= later(STREAM_BATCH_MS, flush);
-      };
-      liveRun.events.forEach((event, index) => (index < after ? renderer.push(event, false) : take(event)));
-      liveRun.messages.slice(messagesShown).forEach(takeMessage);
-      // Nothing awaits between reading the events and subscribing, so none can slip through.
-      unsubscribe = runner.subscribe(id, (update) => {
-        if (update.type === "event" && update.runId === pageRun) take(update.event);
-        else if (update.type === "message" && update.runId === pageRun) takeMessage(update.message);
-        else if (update.type === "start" || update.type === "end") {
-          if (batch) flush();
-          reload();
-        }
-      });
-      const panels = async () => {
-        const [transcript, workspace] = await Promise.all([runner.transcript(id), runner.workspace()]).catch(() => []);
-        if (closed) return;
-        if (transcript && workspace) send("patch", { ops: sidePanels(transcript, runner.list(), workspace, pages) });
-        later(STREAM_PANELS_MS, panels);
-      };
-      later(STREAM_PANELS_MS, panels);
-    }
-    const ping = () => {
-      if (closed) return;
-      send("ping", {});
-      later(STREAM_PING_MS, ping);
-    };
-    later(STREAM_PING_MS, ping);
-  };
-  // The page reconnects after a lost stream, so a failure here ends the stream and lets it come
-  // back; the rest of the service is untouched.
-  try {
-    attach();
-  } catch (error) {
-    log.error("stream failed", { conversation: id, error: error instanceof Error ? (error.stack ?? error.message) : String(error) });
-    close();
-  }
 }
 
 function found(view: ConversationView | undefined): Reply {
@@ -315,7 +169,8 @@ function promptRequest(value: unknown): PromptRequest {
 function launchRequest(value: unknown): LaunchRequest {
   const request: LaunchRequest = promptRequest(value);
   const { repository, openPr, baseBranch } = value as Record<string, unknown>;
-  if (repository !== undefined) {
+  if (repository === NO_REPOSITORY) request.repository = repository;
+  else if (repository !== undefined) {
     if (typeof repository !== "string") throw new InvalidRequest(`repository is ${describe(repository)}, not a string`);
     if (!URL.canParse(repository)) throw new InvalidRequest(`repository ${JSON.stringify(repository)} is not a URL`);
     if (new URL(repository).protocol !== "https:") throw new InvalidRequest(`repository ${JSON.stringify(repository)} is not an https URL`);
@@ -340,6 +195,34 @@ function availabilityQuery(params: URLSearchParams): AvailabilityQuery {
   if (conversation === null) return {};
   if (!ID_ONLY.test(conversation)) throw new InvalidRequest("conversation is not a conversation id");
   return { conversation };
+}
+
+/** `?have=<runId>:<count>,...`: how many of each run's events the caller already holds. */
+function haveQuery(params: URLSearchParams): Map<string, number> {
+  const have = new Map<string, number>();
+  for (const entry of (params.get("have") ?? "").split(",")) {
+    if (!entry) continue;
+    const [runId, count, ...rest] = entry.split(":");
+    if (!runId || !ID_ONLY.test(runId) || !/^\d{1,9}$/.test(count ?? "") || rest.length)
+      throw new InvalidRequest("have is not a list of runId:count");
+    have.set(runId, Number(count));
+  }
+  return have;
+}
+
+function secretsRequest(value: unknown): Secrets {
+  if (!isObject(value)) throw new InvalidRequest("the body is not a JSON object");
+  const secrets: Secrets = {};
+  for (const key of SECRET_KEYS) {
+    const secret = value[key];
+    if (secret === undefined) continue;
+    // Never the value itself in the reason.
+    if (typeof secret !== "string" || !secret.trim() || secret.length > MAX_SECRET_CHARS || /[\r\n\0]/.test(secret.trim()))
+      throw new InvalidRequest(`${key} is not a single line of at most ${MAX_SECRET_CHARS} characters`);
+    secrets[key] = secret.trim();
+  }
+  if (secrets.platformUrl !== undefined && !/^https?:\/\//.test(secrets.platformUrl)) throw new InvalidRequest("platformUrl is not a URL");
+  return secrets;
 }
 
 /** A plain branch name: what `git check-ref-format --branch` allows, without the odd corners, and never an option. */

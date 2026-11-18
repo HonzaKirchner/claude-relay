@@ -2,7 +2,7 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    // Conversations live only in PostgreSQL, so the tests need one; see test/postgres.ts.
-    globalSetup: ["./test/postgres.ts"],
+    // Each test runs real git and node child processes, which a busy machine slows down.
+    testTimeout: 30_000,
   },
 });

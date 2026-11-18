@@ -1,24 +1,5 @@
-// Creates or updates the tables in the database at
-// DB_CONNECTION_STRING. The service does the same on start; this is for doing
-// it by hand. Idempotent.
-//
-//   npm run db:init      (loads .env if present)
+// The service keeps no database any more: what it remembers is in files it creates itself on
+// start (see src/store.ts). This stays, doing nothing, because the Coder template runs
+// `npm run db:init` before starting the service and will not start it if that fails.
 
-import { Store } from "../src/db.ts";
-
-const connectionString = process.env.DB_CONNECTION_STRING;
-if (!connectionString) {
-  console.error("DB_CONNECTION_STRING is not set (add it to .env or the environment).");
-  process.exit(1);
-}
-
-const store = new Store(connectionString);
-try {
-  await store.migrate();
-  console.log("Database schema is up to date.");
-} catch (error) {
-  console.error("Database initialisation failed:", error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-} finally {
-  await store.close();
-}
+console.log("claude-relay has no database to prepare.");
