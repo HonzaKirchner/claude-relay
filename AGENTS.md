@@ -70,7 +70,7 @@ The contract has two layers:
 
 ### Transport
 
-- Rakazo reaches the service through Coder's app proxy at `/@<owner>/<workspace>/apps/claude/<path>`, authenticated by the workspace owner's Coder token. The app slug **`claude` is hard-coded in Rakazo** (`APP_SLUG` in `apify-remote-platform-cloud-agent.ts`; it was `claude-code-runner` before the fork's commit `51840fb`). The adapter builds the conversation page link itself from that path, so `url` in responses is for other callers.
+- Rakazo reaches the service through Coder's app proxy at `/@<owner>/<workspace>/apps/claude/<path>`, authenticated by the workspace owner's Coder token. The app slug **`claude` is hard-coded in Rakazo** (`APP_SLUG` in `apify-remote-platform-cloud-agent.ts`; it was `claude-code-runner` before the fork's commit `51840fb`). The service has no pages and its responses carry no `url`: the adapter links an agent to the workspace's own page in Coder.
 - `apify-remote-platform` is a second caller of the same contract: Rakazo's adapter can send every agent to it instead, and it passes each request on to the relay of the workspace it chose, under the canonical `/conversations` paths, through the same app proxy. What Rakazo relies on below therefore holds for requests that arrive that way too; the platform reads `code: "busy"` itself, to try another workspace.
 - The service itself does no authentication and listens on loopback only, by design: it runs only inside a Coder workspace. Do not add a non-loopback listener without adding authentication.
 - Rakazo treats a non-JSON or code-less error response as "workspace not reachable" and starts the workspace. So **every response from this service must be JSON**, and every error must carry a `code`.
